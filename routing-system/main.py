@@ -60,6 +60,7 @@ async def serve():
         ]
     )
     servicer = RouterServicer(cache, limiter, dispatcher, queue)
+    await servicer.start()
     pb_grpc.add_RouterServiceServicer_to_server(servicer, server)
 
     server.add_insecure_port(LISTEN_ADDR)

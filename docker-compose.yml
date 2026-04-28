@@ -90,6 +90,8 @@ services:
       context: .
       dockerfile: target-server/Dockerfile
     container_name: stegnar-target
+    volumes:
+      - ./test_images:/test_images:ro
     networks:
       - stegnar-net
     restart: unless-stopped
@@ -207,48 +209,85 @@ services:
     restart: unless-stopped
 
   # ===========================================================================
-  # Component 1 — Endpoint Agent (victim node A)
+  # Component 1 — Endpoint Agents (Nodes 1-4)
   # ===========================================================================
 
-  victim-a:
+  node-1:
     build:
       context: .
       dockerfile: endpoint-agent/Dockerfile
-    container_name: stegnar-victim-a
+    container_name: stegnar-node-1
     depends_on:
       routing:
         condition: service_healthy
     environment:
-      ENDPOINT_ID: victim-a
+      ENDPOINT_ID: node-1
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
-      SSLKEYLOGFILE: /tmp/victim-a-keys.log
-      TARGET_HOST: target-server
+      TARGET_URL: "http://target-server/cover_test00001.jpg"
       LOG_LEVEL: INFO
     networks:
       - stegnar-net
     cap_add:
-      - NET_RAW       # Scapy raw capture
+      - NET_RAW
     restart: unless-stopped
 
-  # ===========================================================================
-  # Component 1 — Endpoint Agent (victim node B)
-  # ===========================================================================
-
-  victim-b:
+  node-2:
     build:
       context: .
       dockerfile: endpoint-agent/Dockerfile
-    container_name: stegnar-victim-b
+    container_name: stegnar-node-2
     depends_on:
       routing:
         condition: service_healthy
     environment:
-      ENDPOINT_ID: victim-b
+      ENDPOINT_ID: node-2
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
-      SSLKEYLOGFILE: /tmp/victim-b-keys.log
-      TARGET_HOST: target-server
+      SSLKEYLOGFILE: /tmp/keys.log
+      TARGET_URL: "https://target-server/cover_test00002.jpg"
+      LOG_LEVEL: INFO
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-3:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-3
+    depends_on:
+      routing:
+        condition: service_healthy
+    environment:
+      ENDPOINT_ID: node-3
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SSLKEYLOGFILE: /tmp/keys.log
+      TARGET_URL: "https://target-server/stego1_test00001.jpg"
+      LOG_LEVEL: INFO
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-4:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-4
+    depends_on:
+      routing:
+        condition: service_healthy
+    environment:
+      ENDPOINT_ID: node-4
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SSLKEYLOGFILE: /tmp/keys.log
+      TARGET_URL: "https://target-server/stego2_test00002.jpg"
       LOG_LEVEL: INFO
     networks:
       - stegnar-net

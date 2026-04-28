@@ -84,9 +84,18 @@ async def _stream_session(
                 except asyncio.QueueEmpty:
                     pass
 
+                # Normalize stream_id to be direction-agnostic so that both
+                # the outbound request and inbound response are buffered together.
+                ep_a = f"{pkt.src_ip}:{pkt.src_port}"
+                ep_b = f"{pkt.dst_ip}:{pkt.dst_port}"
+                if (pkt.dst_port in (80, 443)) or ep_a > ep_b:
+                    stream_id = f"{ep_a}-{ep_b}"
+                else:
+                    stream_id = f"{ep_b}-{ep_a}"
+
                 chunk = pb.PayloadChunk(
                     endpoint_id = ENDPOINT_ID,
-                    stream_id   = f"{pkt.src_ip}:{pkt.src_port}-{pkt.dst_ip}:{pkt.dst_port}",
+                    stream_id   = stream_id,
                     raw_bytes   = pkt.raw_bytes,
                     sha256      = pkt.sha256,
                     ssl_keylog  = "\n".join(ssl_lines),

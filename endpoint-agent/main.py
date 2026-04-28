@@ -49,6 +49,27 @@ async def main():
         os.environ.get("ENDPOINT_ID", "?"), IFACE, KEYLOG_PATH
     )
 
+    TARGET_URL = os.environ.get("TARGET_URL")
+
+    async def auto_fetch():
+        if not TARGET_URL:
+            return
+        logger.info("Auto-fetch task sleeping for 15s to allow system warmup...")
+        await asyncio.sleep(15)
+        logger.info("Executing auto-fetch for %s", TARGET_URL)
+        import subprocess
+        try:
+            if TARGET_URL.startswith("https://"):
+                host = TARGET_URL.split("https://")[1].split("/")[0]
+                path = "/" + TARGET_URL.split(host + "/")[1]
+                cmd = f"echo -e 'GET {path} HTTP/1.1\\r\\nHost: {host}\\r\\nConnection: close\\r\\n\\r\\n' | openssl s_client -connect target-server:443 -quiet > /dev/null 2>&1"
+            else:
+                cmd = f"curl -s {TARGET_URL} > /dev/null"
+            subprocess.run(cmd, shell=True, executable="/bin/bash")
+            logger.info("Auto-fetch complete.")
+        except Exception as e:
+            logger.error("Auto-fetch failed: %s", e)
+
     tasks = [
         asyncio.create_task(
             capture_loop(IFACE, pkt_queue, stop_event),
@@ -62,6 +83,10 @@ async def main():
             stream_to_router(pkt_queue, key_queue, stop_event),
             name="grpc-stream"
         ),
+        asyncio.create_task(
+            auto_fetch(),
+            name="auto-fetch"
+        )
     ]
 
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)

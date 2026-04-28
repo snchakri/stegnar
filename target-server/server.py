@@ -11,40 +11,22 @@ import os
 import ssl
 import hashlib
 import random
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-STEGO_DIR = Path("/images/stego")
-COVER_DIR = Path("/images/cover")
+TEST_IMAGES_DIR = Path("/test_images")
 
-# Pre-load a few images at startup
-def _load_images(directory: Path, ext=".png"):
-    files = list(directory.glob(f"*{ext}")) if directory.exists() else []
-    loaded = []
-    for f in files[:10]:  # load up to 10
-        loaded.append((f.name, f.read_bytes()))
-    return loaded
+# Load the specific images
+def _load_images():
+    images = {}
+    if TEST_IMAGES_DIR.exists():
+        for f in TEST_IMAGES_DIR.glob("*.*"):
+            if f.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                images[f.name] = f.read_bytes()
+    return images
 
-STEGO_IMAGES = _load_images(STEGO_DIR)
-COVER_IMAGES = _load_images(COVER_DIR)
-
-# Fallback: generate a tiny synthetic PNG if no images mounted
-def _synthetic_png(stego: bool = False) -> bytes:
-    """1x1 pixel PNG — just to have something valid for MIME testing."""
-    import struct, zlib
-    def make_png(r, g, b):
-        def chunk(tag, data):
-            c = struct.pack('>I', len(data)) + tag + data
-            return c + struct.pack('>I', zlib.crc32(c[4:]) & 0xffffffff)
-        raw = b'\x00' + bytes([r, g, b, 255])  # filter byte + RGBA
-        idat = zlib.compress(raw)
-        return (
-            b'\x89PNG\r\n\x1a\n'
-            + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
-            + chunk(b'IDAT', idat)
-            + chunk(b'IEND', b'')
-        )
-    return make_png(200, 50, 50) if stego else make_png(50, 150, 200)
+IMAGES = _load_images()
 
 
 class StegHandler(BaseHTTPRequestHandler):
@@ -60,48 +42,28 @@ class StegHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802
-        path = self.path.split("?")[0]
+        path = self.path.split("?")[0].lstrip("/")
 
-        if path == "/health":
-            body = b'{"status":"ok","stego_count":' + str(len(STEGO_IMAGES)).encode() + b',"cover_count":' + str(len(COVER_IMAGES)).encode() + b'}'
+        if path == "health":
+            body = b'{"status":"ok","images":' + str(len(IMAGES)).encode() + b'}'
             self._send(200, "application/json", body)
+            return
 
-        elif path == "/stego.png":
-            if STEGO_IMAGES:
-                name, data = random.choice(STEGO_IMAGES)
-            else:
-                data = _synthetic_png(stego=True)
-            self._send(200, "image/png", data)
+        if path in IMAGES:
+            content_type = "image/jpeg" if path.lower().endswith(".jpg") else "image/png"
+            self._send(200, content_type, IMAGES[path])
+            return
 
-        elif path == "/cover.png":
-            if COVER_IMAGES:
-                name, data = random.choice(COVER_IMAGES)
-            else:
-                data = _synthetic_png(stego=False)
-            self._send(200, "image/png", data)
-
-        elif path == "/random":
-            use_stego = random.random() > 0.5
-            if use_stego and STEGO_IMAGES:
-                name, data = random.choice(STEGO_IMAGES)
-            elif COVER_IMAGES:
-                name, data = random.choice(COVER_IMAGES)
-            else:
-                data = _synthetic_png(stego=use_stego)
-            header = b"stego" if use_stego else b"cover"
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("X-Image-Type", header.decode())
-            self.send_header("X-SHA256", hashlib.sha256(data).hexdigest())
-            self.end_headers()
-            self.wfile.write(data)
-
-        else:
-            self._send(404, "text/plain", b"Not Found")
+        self._send(404, "text/plain", b"Not Found")
 
 
-def main():
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", 80), StegHandler)
+    print(f"[TARGET] HTTP server listening on port 80")
+    server.serve_forever()
+
+
+def run_https_server():
     cert_file = Path("/certs/server.crt")
     key_file  = Path("/certs/server.key")
 
@@ -114,7 +76,7 @@ def main():
             "-keyout", str(key_file),
             "-out", str(cert_file),
             "-days", "365", "-nodes",
-            "-subj", "/CN=stegnar-target/O=STEGNAR/C=IN",
+            "-subj", "/CN=target-server/O=STEGNAR/C=IN",
             "-addext", "subjectAltName=DNS:target-server,DNS:localhost,IP:127.0.0.1"
         ], check=True)
         print("[TARGET] Certificate generated.")
@@ -122,14 +84,22 @@ def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(cert_file), str(key_file))
 
-    port = int(os.environ.get("PORT", "443"))
-    server = HTTPServer(("0.0.0.0", port), StegHandler)
+    server = HTTPServer(("0.0.0.0", 443), StegHandler)
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
-
-    print(f"[TARGET] HTTPS server listening on port {port}")
-    print(f"[TARGET] Stego images: {len(STEGO_IMAGES)}, Cover images: {len(COVER_IMAGES)}")
+    print(f"[TARGET] HTTPS server listening on port 443")
     server.serve_forever()
 
+
+def main():
+    print(f"[TARGET] Loaded images: {list(IMAGES.keys())}")
+    t_http = threading.Thread(target=run_http_server, daemon=True)
+    t_https = threading.Thread(target=run_https_server, daemon=True)
+    
+    t_http.start()
+    t_https.start()
+    
+    t_http.join()
+    t_https.join()
 
 if __name__ == "__main__":
     main()
