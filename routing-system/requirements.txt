@@ -1,0 +1,6 @@
+grpcio==1.64.0
+grpcio-tools==1.64.0
+protobuf>=5.26.1
+redis[hiredis]==5.0.4
+pyshark==0.6
+scapy==2.5.0

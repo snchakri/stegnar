@@ -1,0 +1,1 @@
+# stegnar proto package
