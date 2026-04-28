@@ -9,6 +9,7 @@ import { StoragePage } from './pages/StoragePage';
 import { PerformancePage } from './pages/PerformancePage';
 import { TopologyPage } from './pages/TopologyPage';
 import { LogsPage } from './pages/LogsPage';
+import { LedgerTrail } from './pages/LedgerTrail';
 import { SettingsPage } from './pages/SettingsPage';
 
 export default function App() {
@@ -23,15 +24,16 @@ export default function App() {
           <main className="flex-1 overflow-auto">
             <Routes>
               <Route path="/" element={<Navigate to="/database" replace />} />
-              <Route path="/database" element={<DatabasePage />} />
-              <Route path="/redis" element={<RedisPage />} />
-              <Route path="/images" element={<ImageFeed />} />
-              <Route path="/ingest" element={<IngestPage />} />
-              <Route path="/storage" element={<StoragePage />} />
+              <Route path="/database"    element={<DatabasePage />} />
+              <Route path="/redis"       element={<RedisPage />} />
+              <Route path="/images"      element={<ImageFeed />} />
+              <Route path="/ingest"      element={<IngestPage />} />
+              <Route path="/storage"     element={<StoragePage />} />
               <Route path="/performance" element={<PerformancePage />} />
-              <Route path="/topology" element={<TopologyPage />} />
-              <Route path="/logs" element={<LogsPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/topology"    element={<TopologyPage />} />
+              <Route path="/logs"        element={<LogsPage />} />
+              <Route path="/ledger"      element={<LedgerTrail />} />
+              <Route path="/settings"    element={<SettingsPage />} />
             </Routes>
           </main>
         </div>
