@@ -19,7 +19,7 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-logger = logging.getLogger("stegnar.buffer_stream.main")
+logger = logging.getLogger("stegnar.data.main")
 
 REDIS_URL    = os.environ.get("REDIS_URL",    "redis://redis:6379")
 REDIS_STREAM = os.environ.get("REDIS_STREAM", "stegnar:db_queue")
@@ -38,7 +38,7 @@ async def consume_loop(redis_client: aioredis.Redis, pg: PostgresWriter, stop_ev
         else:
             raise
 
-    logger.info("System Buffer Stream consumer loop started.")
+    logger.info("Data Layer consumer loop started.")
 
     while not stop_event.is_set():
         try:
@@ -85,12 +85,12 @@ async def serve():
     consumer_task = asyncio.create_task(consume_loop(redis_client, pg, stop_event))
 
     await stop_event.wait()
-    logger.info("Stopping System Buffer Stream...")
+    logger.info("Stopping Data Layer...")
 
     await consumer_task
     await pg.close()
     await redis_client.aclose()
-    logger.info("System Buffer Stream stopped cleanly.")
+    logger.info("Data Layer stopped cleanly.")
 
 
 if __name__ == "__main__":

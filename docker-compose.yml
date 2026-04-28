@@ -117,8 +117,9 @@ services:
       REDIS_URL: redis://redis:6379
       MITM_GRPC_ADDR: mitm:50052
       GRPC_LISTEN_ADDR: "0.0.0.0:50051"
-      RATE_LIMIT_RPS: "100"
+      RATE_LIMIT_RPS: "1000"
       LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
     ports:
       - "50051:50051"    # gRPC for endpoint agents
     networks:
@@ -128,7 +129,8 @@ services:
       test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=5)"]
       interval: 10s
       timeout: 10s
-      retries: 10
+      retries: 20
+      start_period: 30s
 
   # ===========================================================================
   # Component 3 — MITM Gateway (privileged, eBPF/XDP)
@@ -156,6 +158,7 @@ services:
       CALPA_TIMEOUT_SEC: "120"
       STEGNAR_ENV: dev
       LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./CALPA-NET-master:/calpa:ro
     ports:
@@ -163,16 +166,22 @@ services:
     networks:
       - stegnar-net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50052'); grpc.channel_ready_future(ch).result(timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
   # ===========================================================================
   # Component 2 — Data Layer (Redis consumer → DB + MinIO)
   # ===========================================================================
 
-  system-buffer-stream:
+  data-layer:
     build:
       context: .
-      dockerfile: system-buffer-stream/Dockerfile
-    container_name: stegnar-buffer-stream
+      dockerfile: data-layer/Dockerfile
+    container_name: stegnar-data-layer
     depends_on:
       redis:
         condition: service_healthy
@@ -192,6 +201,7 @@ services:
       MINIO_BUCKET_ARTIFACTS: stegnar-artifacts
       MINIO_BUCKET_PCAPS: stegnar-pcaps
       LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
     networks:
       - stegnar-net
     restart: unless-stopped

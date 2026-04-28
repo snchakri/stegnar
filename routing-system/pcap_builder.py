@@ -21,19 +21,19 @@ class PcapBuilder:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-    async def build_pcap(self, stream_id: str, raw_bytes: bytes, ssl_keys: str) -> str:
+    async def build_pcap(self, stream_id: str, raw_bytes: bytes, ssl_keys: str) -> tuple[str, bytes]:
         """
-        Builds a forensic PCAP file from the raw bytes and saves the SSL keys alongside it.
-        Returns the URI to the saved artifact (mocked as an s3:// URI for the data layer).
+        Builds a forensic PCAP file, decrypts it using Tshark if keys are present,
+        and attempts to extract any image payload.
+        Returns (pcap_uri, image_bytes).
         """
-        # Run disk IO in a background thread to avoid blocking asyncio loop
         loop = asyncio.get_event_loop()
-        uri = await loop.run_in_executor(
-            None, self._sync_build_pcap, stream_id, raw_bytes, ssl_keys
+        uri, image_bytes = await loop.run_in_executor(
+            None, self._sync_build_and_carve, stream_id, raw_bytes, ssl_keys
         )
-        return uri
+        return uri, image_bytes
 
-    def _sync_build_pcap(self, stream_id: str, raw_bytes: bytes, ssl_keys: str) -> str:
+    def _sync_build_and_carve(self, stream_id: str, raw_bytes: bytes, ssl_keys: str) -> tuple[str, bytes]:
         safe_id = stream_id.replace(":", "_").replace("-", "_")
         uid = uuid.uuid4().hex[:8]
         ts = int(time.time())
@@ -41,30 +41,51 @@ class PcapBuilder:
         base_name = f"{self.output_dir}/{safe_id}_{ts}_{uid}"
         pcap_path = f"{base_name}.pcap"
         key_path  = f"{base_name}.keys"
+        carved_path = f"{base_name}.extracted"
 
-        # Write SSL keys if present
+        # 1. Write SSL keys
+        has_keys = False
         if ssl_keys and ssl_keys.strip():
             with open(key_path, "w") as f:
                 f.write(ssl_keys)
+            has_keys = True
 
-        # Write raw bytes as PCAP using Scapy
-        # Since we receive raw IP packets from the endpoint agent's sniffer
+        # 2. Write raw PCAP
         try:
             from scapy.all import IP, wrpcap
-            # Convert raw bytes back to an IP packet
             pkt = IP(raw_bytes)
             wrpcap(pcap_path, [pkt])
-            logger.debug("Generated forensic PCAP: %s", pcap_path)
-            
-            # In a full deployment, this is where we'd invoke PyShark/Tshark 
-            # to validate or dissect the decrypted payload:
-            # e.g., tshark -r pcap_path -o tls.keylog_file:key_path -V
-            
         except Exception as e:
-            logger.error("Failed to build PCAP using Scapy: %s", e)
-            # Fallback: just write raw bytes
-            with open(pcap_path + ".raw", "wb") as f:
-                f.write(raw_bytes)
+            logger.error("Scapy wrpcap failed: %s", e)
+            return f"error://{e}", b""
 
-        # Return a simulated MinIO URI for the data layer
-        return f"s3://stegnar-pcaps/{safe_id}_{ts}_{uid}.pcap"
+        # 3. Deep Carving with Tshark
+        image_bytes = b""
+        if has_keys:
+            try:
+                import subprocess
+                # Command to extract the largest exported object (usually the image)
+                # tshark -o "tls.keylog_file:keys" -r pcap --export-objects "http,dir"
+                export_dir = f"{base_name}_ext"
+                os.makedirs(export_dir, exist_ok=True)
+                
+                cmd = [
+                    "tshark", "-q",
+                    "-o", f"tls.keylog_file:{key_path}",
+                    "-r", pcap_path,
+                    "--export-objects", f"http,{export_dir}"
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=10)
+                
+                # Find the largest file in the export directory (the image)
+                files = [os.path.join(export_dir, f) for f in os.listdir(export_dir)]
+                if files:
+                    largest_file = max(files, key=os.path.getsize)
+                    with open(largest_file, "rb") as f:
+                        image_bytes = f.read()
+                    logger.info("Deep Carving SUCCESS: Extracted %d bytes from TLS stream %s", len(image_bytes), stream_id)
+            except Exception as e:
+                logger.error("Deep Carving failed: %s", e)
+
+        uri = f"s3://stegnar-pcaps/{safe_id}_{ts}_{uid}.pcap"
+        return uri, image_bytes

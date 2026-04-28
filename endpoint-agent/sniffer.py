@@ -70,8 +70,8 @@ async def capture_loop(
         # Thread-safe push into the asyncio queue
         loop.call_soon_threadsafe(queue.put_nowait, cp)
 
-    logger.info("Starting packet capture on interface '%s'", iface)
-    sniffer = AsyncSniffer(iface=iface, prn=_handle_pkt, store=False)
+    logger.info("Starting packet capture on interface '%s' (filter: not port 50051)", iface)
+    sniffer = AsyncSniffer(iface=iface, prn=_handle_pkt, store=False, filter="not port 50051")
     sniffer.start()
 
     try:

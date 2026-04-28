@@ -30,6 +30,7 @@ from rate_limiter import RateLimiter
 from dispatcher   import MITMDispatcher
 from queue_writer import QueueWriter
 from pcap_builder import PcapBuilder
+from key_store    import KeyStore
 
 logger = logging.getLogger("stegnar.routing.servicer")
 
@@ -66,6 +67,7 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
         self._dispatcher = dispatcher
         self._queue      = queue
         self._pcap_builder = PcapBuilder()
+        self._key_store    = KeyStore()
 
     async def StreamPayload(self, request_iterator, context):  # noqa: N802
         chunks_recv = 0
@@ -78,9 +80,13 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
                 # Silently drop — gRPC flow control will throttle the client
                 continue
 
-            # 3. Build forensic PCAP and get MinIO URI
-            pcap_uri = await self._pcap_builder.build_pcap(
-                chunk.stream_id, chunk.raw_bytes, chunk.ssl_keylog
+            # 3. Build forensic PCAP and get MinIO URI + Deep Carved Image
+            # Accumulate keys for this stream
+            self._key_store.add_keys(chunk.stream_id, chunk.ssl_keylog)
+            all_keys = self._key_store.get_keys(chunk.stream_id)
+
+            pcap_uri, carved_image = await self._pcap_builder.build_pcap(
+                chunk.stream_id, chunk.raw_bytes, all_keys
             )
 
             # 4. Cache lookup
@@ -103,8 +109,14 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
                 )
                 continue
 
-            # 5. MIME sniff — only dispatch images
-            if not _sniff_image(chunk.raw_bytes):
+            # 5. Image Determination (MIME sniff OR Deep Carved)
+            image_bytes_to_analyze = b""
+            if _sniff_image(chunk.raw_bytes):
+                image_bytes_to_analyze = chunk.raw_bytes
+            elif carved_image:
+                image_bytes_to_analyze = carved_image
+
+            if not image_bytes_to_analyze:
                 await self._queue.write_event(
                     stream_id   = chunk.stream_id,
                     endpoint_id = chunk.endpoint_id,
@@ -121,11 +133,11 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
             # 6. Dispatch to MITM Gateway for CALPA-NET analysis
             logger.info(
                 "DISPATCHING image endpoint=%s stream=%s sha=%s bytes=%d",
-                chunk.endpoint_id, chunk.stream_id, chunk.sha256[:12], len(chunk.raw_bytes)
+                chunk.endpoint_id, chunk.stream_id, chunk.sha256[:12], len(image_bytes_to_analyze)
             )
             result = await self._dispatcher.analyze(
                 stream_id   = chunk.stream_id,
-                image_bytes = chunk.raw_bytes,
+                image_bytes = image_bytes_to_analyze,
                 sha256      = chunk.sha256,
                 endpoint_id = chunk.endpoint_id,
                 src_ip      = chunk.src_ip,

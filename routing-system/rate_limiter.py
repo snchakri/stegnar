@@ -18,7 +18,7 @@ import redis.asyncio as aioredis
 logger = logging.getLogger("stegnar.routing.rate_limiter")
 
 REDIS_URL   = os.environ.get("REDIS_URL",       "redis://redis:6379")
-RATE_LIMIT  = int(os.environ.get("RATE_LIMIT_RPS", "100"))   # chunks per second
+RATE_LIMIT  = int(os.environ.get("RATE_LIMIT_RPS", "1000"))   # chunks per second
 WINDOW_MS   = 1000   # 1 second sliding window
 
 _PREFIX = "stegnar:rl:"

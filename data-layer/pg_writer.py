@@ -10,7 +10,7 @@ import datetime
 
 import asyncpg
 
-logger = logging.getLogger("stegnar.buffer_stream.pg")
+logger = logging.getLogger("stegnar.data.pg")
 
 DSN = os.environ.get("POSTGRES_DSN", "postgresql://stegnar:stegnar_secret@postgres:5432/stegnar")
 
