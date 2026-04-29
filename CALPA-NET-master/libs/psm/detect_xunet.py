@@ -38,7 +38,7 @@ def write_2_config_file(index_block, index_layer, acc, rate, config_log, test_ac
     test_cfg = config_log
     config_raw = ConfigParser.RawConfigParser()
     config_raw.read(test_cfg)
-    print 'rate:', rate, '  acc: ', acc
+    print('rate:', rate, '  acc: ', acc)
     last_acc = config_raw.getfloat('acc_block' + index_block, 'layer' + index_layer)
     # It can be modified according to the actual situation
     if last_acc <= acc or abs(test_acc - acc) <= 0.05:
@@ -200,7 +200,7 @@ def Li_detect_on_conv_layer(model_class, index_of_block, index_of_layer, gen, ba
         runner.start_threads(sess, 1)
         f_log.write('----------- block ' + str(index_of_block) + ' layer ' + str(index_of_layer) + '-------------\n')
 
-        print 'block:', str(index_of_block)
+        print('block:', str(index_of_block))
         BN_index_layer_s = 5 * (index_of_block - 1) + 1
         BN_index_layer_m1 = 5 * (index_of_block - 1) + 2
         BN_index_layer_m2 = 5 * (index_of_block - 1) + 4
@@ -259,9 +259,9 @@ def Li_detect_on_conv_layer(model_class, index_of_block, index_of_layer, gen, ba
             #     next_s_kernel_data, next_s_bias_data = sess.run([next_s_kernel_tensor, next_s_bias_tensor])
             if index_of_block == 5:
                 next_weights_data = sess.run([next_weights_tensor])
-                print 'next weights data ', len(next_weights_data[0])
+                print('next weights data ', len(next_weights_data[0]))
                 next_pool_data = sess.run([next_pool_tensor])
-                print 'next pool data ', len(next_pool_data[0])
+                print('next pool data ', len(next_pool_data[0]))
 
             shortcut_kernel = s_kernel_data
             shortcut_kernel_abs = np.abs(shortcut_kernel)
@@ -274,7 +274,7 @@ def Li_detect_on_conv_layer(model_class, index_of_block, index_of_layer, gen, ba
             for ratio in range(1, 20):
                 lens = int((20 - ratio) * 0.05 * shape[3])
                 S = channal_L1_sorted_index[0:lens]
-                print S
+                print(S)
                 sess.run(tf.assign(s_kernel_tensor, s_kernel_data[:, :, :, S], validate_shape=False))
                 # sess.run(tf.assign(s_bias_tensor, s_bias_data[S], validate_shape=False))
                 sess.run(tf.assign(s_mean_tensor, s_mean_data[S], validate_shape=False))
@@ -320,5 +320,5 @@ def Li_detect_on_conv_layer(model_class, index_of_block, index_of_layer, gen, ba
                                     config_log, test_acc)
 
         else:
-            print "wrong layer index!"
+            print("wrong layer index!")
 

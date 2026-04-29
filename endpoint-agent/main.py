@@ -57,18 +57,63 @@ async def main():
         logger.info("Auto-fetch task sleeping for 15s to allow system warmup...")
         await asyncio.sleep(15)
         logger.info("Executing auto-fetch for %s", TARGET_URL)
-        import subprocess
+        import subprocess, tempfile, hashlib, struct, time as _time
         try:
+            env = os.environ.copy()
+            env["SSLKEYLOGFILE"] = KEYLOG_PATH
+
             if TARGET_URL.startswith("https://"):
-                host = TARGET_URL.split("https://")[1].split("/")[0]
-                path = "/" + TARGET_URL.split(host + "/")[1]
-                cmd = f"echo -e 'GET {path} HTTP/1.1\\r\\nHost: {host}\\r\\nConnection: close\\r\\n\\r\\n' | openssl s_client -connect target-server:443 -quiet > /dev/null 2>&1"
+                # For HTTPS: curl saves the response body to a temp file.
+                # We then inject those raw image bytes as a synthetic packet so
+                # Tshark doesn't need to decrypt — the node already has plaintext.
+                fd, tmp_img = tempfile.mkstemp(suffix=".jpg")
+                os.close(fd)
+                cmd = f"curl -sk -o {tmp_img} {TARGET_URL}"
+                subprocess.run(cmd, shell=True, executable="/bin/bash", env=env)
+
+                with open(tmp_img, "rb") as f:
+                    img_bytes = f.read()
+                os.unlink(tmp_img)
+
+                if len(img_bytes) > 1000:
+                    sha = hashlib.sha256(img_bytes).hexdigest()
+                    # Inject as a synthetic captured-packet wrapping the raw image.
+                    # stream_id uses the target host:443 pair so routing can identify it.
+                    from sniffer import CapturedPacket
+                    import socket as _sock
+                    try:
+                        target_ip = _sock.gethostbyname("target-server")
+                    except Exception:
+                        target_ip = "0.0.0.0"
+                    try:
+                        my_ip = _sock.gethostbyname(_sock.gethostname())
+                    except Exception:
+                        my_ip = os.environ.get("ENDPOINT_ID", "unknown")
+
+                    pkt = CapturedPacket(
+                        raw_bytes=img_bytes,
+                        sha256=sha,
+                        src_ip=target_ip,
+                        dst_ip=my_ip,        # unique per node → unique stream_id
+                        src_port=443,
+                        dst_port=int(sha[:4], 16) % 60000 + 1024,  # deterministic unique port
+                        captured_at=int(_time.time()),
+                    )
+                    await pkt_queue.put(pkt)
+                    logger.info("HTTPS auto-fetch: injected %d bytes for analysis.", len(img_bytes))
+                else:
+                    logger.warning("HTTPS auto-fetch: empty or too-small response from %s", TARGET_URL)
+
             else:
-                cmd = f"curl -s {TARGET_URL} > /dev/null"
-            subprocess.run(cmd, shell=True, executable="/bin/bash")
+                # HTTP: just trigger the download; the sniffer captures it live
+                cmd = f"curl -s -o /dev/null {TARGET_URL}"
+                subprocess.run(cmd, shell=True, executable="/bin/bash", env=env)
+
             logger.info("Auto-fetch complete.")
         except Exception as e:
             logger.error("Auto-fetch failed: %s", e)
+
+
 
     tasks = [
         asyncio.create_task(

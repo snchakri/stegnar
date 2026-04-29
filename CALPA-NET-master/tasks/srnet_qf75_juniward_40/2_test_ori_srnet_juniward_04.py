@@ -23,7 +23,7 @@ with open(TEST_COVER_DIR) as f:
 
 test_ds_size = len(test_cover_list) * 2
 
-print 'test_ds_size: %i' % test_ds_size
+print('test_ds_size: %i' % test_ds_size)
 if test_ds_size % test_batch_size != 0:
     raise ValueError("change batch size for testing!")
 test_dataset(SRNet, test_gen, test_batch_size, test_ds_size, LOAD_CKPT)

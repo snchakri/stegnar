@@ -159,11 +159,11 @@ def xunet_train(model_class, train_gen, valid_gen, train_batch_size,
         if len(shape) == 4:  # Focus only on convolutional layers
             variable_parameters = 1
             for dim in shape:
-                print 'dim:', dim
+                print('dim:', dim)
                 variable_parameters *= dim.value
-            print 'variable_parameters:', variable_parameters
+            print('variable_parameters:', variable_parameters)
             total_parameters += variable_parameters
-    print "total_parameters:", total_parameters
+    print("total_parameters:", total_parameters)
 
     saver = tf.train.Saver(max_to_keep=10000)
     with tf.Session() as sess:
@@ -185,7 +185,7 @@ def xunet_train(model_class, train_gen, valid_gen, train_batch_size,
                   test_accuracy_s.reset_variable_op])
 
         sess.run(enable_training_op)
-        print "network will be evaluatd every %i iterations on validation set" % valid_interval
+        print("network will be evaluatd every %i iterations on validation set" % valid_interval)
         for i in xrange(start + 1, max_iter + 1):
             sess.run(train_op)
             if i % train_interval == 0:
@@ -195,27 +195,27 @@ def xunet_train(model_class, train_gen, valid_gen, train_batch_size,
                 writer.add_summary(s, i)
             if i % valid_interval == 0:
                 sess.run(disable_training_op)
-                print 'valid: batch_size:', sess.run(batch_size)
+                print('valid: batch_size:', sess.run(batch_size))
                 _time = time.time()
                 for j in range(0, valid_ds_size, valid_batch_size):
                     sess.run([increment_valid])
                 _acc_val = sess.run(valid_accuracy_s.mean_variable)
                 _loss_val = sess.run(valid_loss_s.mean_variable)
-                print 'iter:', i, "-- accuracy on validation set:", _acc_val, "-- loss:", _loss_val
-                print "evaluation time on validation set:", time.time() - _time, "seconds"
+                print('iter:', i, "-- accuracy on validation set:", _acc_val, "-- loss:", _loss_val)
+                print("evaluation time on validation set:", time.time() - _time, "seconds")
                 valid_loss_s.add_summary(sess, writer, i)
                 valid_accuracy_s.add_summary(sess, writer, i)
                 sess.run(enable_training_op)
             if i % test_interval == 0:
                 sess.run(enable_test_op)
-                print 'test: batch_size:', sess.run(batch_size)
+                print('test: batch_size:', sess.run(batch_size))
                 _time = time.time()
                 for j in range(0, test_ds_size, test_batch_size):
                     sess.run([increment_test])
                 _acc_val = sess.run(test_accuracy_s.mean_variable)
                 _loss_val = sess.run(test_loss_s.mean_variable)
-                print 'iter:', i, "-- accuracy on test set:", _acc_val, "-- loss:", _loss_val
-                print "test time on test set:", time.time() - _time, "seconds"
+                print('iter:', i, "-- accuracy on test set:", _acc_val, "-- loss:", _loss_val)
+                print("test time on test set:", time.time() - _time, "seconds")
                 test_loss_s.add_summary(sess, writer, i)
                 test_accuracy_s.add_summary(sess, writer, i)
                 sess.run(enable_training_op)
@@ -273,7 +273,7 @@ def test_dataset_and_get_csv(model_class, gen, batch_size, ds_size, load_path, c
 
         mean_loss, mean_accuracy = sess.run([loss_summary.mean_variable,
                                              accuracy_summary.mean_variable])
-    print "Accuracy:", mean_accuracy, " | Loss:", mean_loss
+    print("Accuracy:", mean_accuracy, " | Loss:", mean_loss)
 
 
 def xunet_test(model_class, gen, batch_size, ds_size, load_path):
@@ -303,4 +303,4 @@ def xunet_test(model_class, gen, batch_size, ds_size, load_path):
             sess.run(increment_op)
         mean_loss, mean_accuracy = sess.run([loss_summary.mean_variable, \
                                              accuracy_summary.mean_variable])
-    print "Accuracy:", mean_accuracy, " | Loss:", mean_loss
+    print("Accuracy:", mean_accuracy, " | Loss:", mean_loss)

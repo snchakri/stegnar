@@ -56,7 +56,7 @@ async def capture_loop(
         if payload_layer is None or len(payload_layer.load) == 0:
             return
 
-        raw = bytes(pkt)
+        raw = bytes(ip)
         sha = hashlib.sha256(raw).hexdigest()
         cp  = CapturedPacket(
             raw_bytes   = raw,

@@ -68,7 +68,7 @@ def write_2_config_file(detect_type, index_layer, acc, rate, config_log_list, te
     config_raw20.read(test_cfg20)
     config_raw50 = ConfigParser.RawConfigParser()
     config_raw50.read(test_cfg50)
-    print 'rate:', rate, '  acc: ', acc
+    print('rate:', rate, '  acc: ', acc)
     # [0.02, 0.05, 0.10, 0.20, 0.50]
     if detect_type == 'Thinet':
         # The last acc recorded was smaller than the current acc
@@ -244,16 +244,16 @@ def detect_one_layer_Thinet(model_class, gen, batch_size, ds_size, thinet_gen, l
                 Input_selected = np.insert(Input_selected, channel_to_remove.__len__() - 1,
                                            Input_data[:, :, :, min_index], 3)
 
-                print 'channel_to_remove: ', channel_to_remove
+                print('channel_to_remove: ', channel_to_remove)
                 if count == Input_data.shape[3] - 1:
                     channel_to_remove.reverse()
                     channals_thinet_sorted_index = channel_to_remove
-                    print 'channals_thinet_sorted_index: ', channals_thinet_sorted_index
+                    print('channals_thinet_sorted_index: ', channals_thinet_sorted_index)
 
             for ratio in range(1, 20):
                 length = int((20 - ratio) * step)
                 s = channals_thinet_sorted_index[0:length]
-                print 's:', s
+                print('s:', s)
                 if len(s) >= 1:
                     sess.run(tf.assign(tar_kernel_tensor, tar_kernel_data[:, :, :, s], validate_shape=False))
                     sess.run(tf.assign(tar_bias_tensor, tar_bias_data[s], validate_shape=False))
@@ -336,16 +336,16 @@ def detect_one_layer_Thinet(model_class, gen, batch_size, ds_size, thinet_gen, l
                 Input_selected = np.insert(Input_selected, channel_to_remove.__len__() - 1,
                                            Input_data[:, :, :, min_index], 3)
 
-                print 'channel_to_remove: ', channel_to_remove
+                print('channel_to_remove: ', channel_to_remove)
                 if count == Input_data.shape[3] - 1:
                     channel_to_remove.reverse()
                     channals_thinet_sorted_index = channel_to_remove
-                    print 'channals_thinet_sorted_index: ', channals_thinet_sorted_index
+                    print('channals_thinet_sorted_index: ', channals_thinet_sorted_index)
 
             for ratio in range(1, 20):
                 length = int((20 - ratio) * step)
                 s = channals_thinet_sorted_index[0:length]
-                print 's:', s
+                print('s:', s)
                 if len(s) >= 1:
                     sess.run(tf.assign(tar_kernel_tensor, tar_kernel_data[:, :, :, s], validate_shape=False))
                     sess.run(tf.assign(tar_bias_tensor, tar_bias_data[s], validate_shape=False))
@@ -437,11 +437,11 @@ def detect_one_layer_Li(model_class, gen, batch_size, ds_size, load_path, layer,
                 channal_L1.append(np.sum(shortcut_kernel_abs[:, :, :, channal]))
             channal_L1 = np.array(channal_L1)
             channal_L1_sorted_index = np.argsort(-channal_L1).tolist()
-            print 'channal_L1_sorted_index :', channal_L1_sorted_index
+            print('channal_L1_sorted_index :', channal_L1_sorted_index)
             for ratio in range(1, 20):
                 length = int((20 - ratio) * 0.05 * shape[3])
                 s = channal_L1_sorted_index[0:length]
-                print 's:', s
+                print('s:', s)
                 if len(s) >= 1:
                     sess.run(tf.assign(s_kernel_tensor, s_kernel_data[:, :, :, s], validate_shape=False))
                     sess.run(tf.assign(s_bias_tensor, s_bias_data[s], validate_shape=False))
@@ -496,11 +496,11 @@ def detect_one_layer_Li(model_class, gen, batch_size, ds_size, load_path, layer,
                 channal_L1.append(np.sum(shortcut_kernel_abs[:, :, :, channal]))
             channal_L1 = np.array(channal_L1)
             channal_L1_sorted_index = np.argsort(-channal_L1).tolist()
-            print 'channal_L1_sorted_index :', channal_L1_sorted_index
+            print('channal_L1_sorted_index :', channal_L1_sorted_index)
             for ratio in range(1, 20):
                 length = int((20 - ratio) * 0.05 * shape[3])  # (20-ratio) * 0.5 * 16
                 s = channal_L1_sorted_index[0:length]
-                print 's:', s
+                print('s:', s)
                 if len(s) >= 1:
                     sess.run(tf.assign(_kernel_tensor, _kernel_data[:, :, :, s], validate_shape=False))
                     sess.run(tf.assign(_bias_tensor, _bias_data[s], validate_shape=False))

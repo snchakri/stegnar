@@ -14,8 +14,7 @@ logger = logging.getLogger("stegnar.mitm.calpa")
 
 PYTHON_CMD   = os.environ.get("CALPA_PYTHON_PATH", "/opt/tf1/bin/python3.7")
 MODEL_PATH   = os.environ.get("CALPA_MODEL_PATH", "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt")
-MODEL_TYPE   = os.environ.get("CALPA_MODEL_TYPE", "srnet")
-LIBS_PATH    = os.environ.get("CALPA_LIBS_PATH",  "/calpa/libs")
+CFG_PATH     = os.environ.get("CALPA_CFG_PATH",   "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg")
 TIMEOUT_SEC  = int(os.environ.get("CALPA_TIMEOUT_SEC", "120"))
 
 WORKER_SCRIPT = "/app/calpa_worker.py"
@@ -31,16 +30,15 @@ async def analyze_image(image_bytes: bytes) -> dict:
     start_time = time.time()
 
     # Write bytes to temp file (worker expects a file path)
-    fd, tmp_path = tempfile.mkstemp(suffix=".png")
+    fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(image_bytes)
 
         payload = json.dumps({
             "image_path": tmp_path,
-            "model_type": MODEL_TYPE,
             "model_path": MODEL_PATH,
-            "libs_path":  LIBS_PATH,
+            "cfg_path":   CFG_PATH,
         })
 
         # Run subprocess asynchronously
@@ -49,6 +47,7 @@ async def analyze_image(image_bytes: bytes) -> dict:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
         )
 
         stdout, stderr = await asyncio.wait_for(
@@ -58,8 +57,15 @@ async def analyze_image(image_bytes: bytes) -> dict:
 
         if proc.returncode != 0:
             err_msg = stderr.decode().strip()
-            logger.error("TF1 Worker failed (exit %d): %s", proc.returncode, err_msg)
-            raise RuntimeError(f"worker exit {proc.returncode}: {err_msg}")
+            out_msg = stdout.decode().strip()
+            # The worker always writes a JSON error to stdout on failure
+            try:
+                err_json = json.loads(out_msg.split('\n')[-1])
+                detail = err_json.get('error', out_msg)
+            except Exception:
+                detail = out_msg or err_msg
+            logger.error("TF1 Worker failed (exit %d): %s", proc.returncode, detail)
+            raise RuntimeError(f"worker exit {proc.returncode}: {detail}")
 
         # Parse JSON from stdout
         out_str = stdout.decode().strip()

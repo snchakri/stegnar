@@ -17,7 +17,7 @@ with open(JUNIWARD_40_VALID_COVER_DIR) as f:
 
 valid_ds_size = len(valid_cover_list) * 2
 
-print 'valid_ds_size: %i' % valid_ds_size
+print('valid_ds_size: %i' % valid_ds_size)
 if valid_ds_size % valid_batch_size != 0:
     raise ValueError("change batch size for validation!")
 thinet_gen = partial(gen_train_or_valid_psm, THINET_COVER_DIR, THINET_STEGO_DIR)

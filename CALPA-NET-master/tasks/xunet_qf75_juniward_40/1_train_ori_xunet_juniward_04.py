@@ -46,9 +46,9 @@ train_ds_size = len(train_cover_list) * 2
 valid_ds_size = len(val_cover_list) * 2
 test_ds_size = len(test_cover_list) * 2
 
-print 'train_ds_size: %i' % train_ds_size
-print 'valid_ds_size: %i' % valid_ds_size
-print 'test_ds_size: %i' % test_ds_size
+print('train_ds_size: %i' % train_ds_size)
+print('valid_ds_size: %i' % valid_ds_size)
+print('test_ds_size: %i' % test_ds_size)
 
 if valid_ds_size % valid_batch_size != 0:
     raise ValueError("change batch size for validation")

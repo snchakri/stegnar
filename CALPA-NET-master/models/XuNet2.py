@@ -71,7 +71,7 @@ def conv_block(input, channels_in, channels_out_1, channels_out_2, istrain, name
 def dense_layer(input, name="dense"):
     with tf.name_scope(name):
         pool_shape = input.get_shape().as_list()
-        print 'dense_layer:', input
+        print('dense_layer:', input)
         # pool_reshape = tf.reshape(input, [pool_shape[0], pool_shape[1] * pool_shape[2] * pool_shape[3]])
         pool_reshape = tf.layers.flatten(input)
         weights = tf.Variable(
@@ -88,7 +88,7 @@ def dense_layer(input, name="dense"):
 class XuNet2(Model):
     def _build_model(self, inputs):
         self.inputs = inputs
-        print inputs
+        print(inputs)
         res = DCT_layer(inputs)
         res = conv_block(res, 16, 12, 24, True, name="block_1")
         res = conv_block(res, 24, 24, 48, True, name="block_2")

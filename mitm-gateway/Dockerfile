@@ -1,4 +1,4 @@
-# ---- Stage 1: TF1 environment -----------------------------------------------
+# ---- Stage 1: TF1 environment (Legacy AI model runtime) -----------------------
 FROM python:3.7 AS tf1-env
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,7 +12,9 @@ RUN pip install --upgrade pip
 RUN pip install --no-cache-dir \
     "tensorflow==1.15.5" \
     "numpy==1.18.5" \
-    "Pillow==9.5.0"
+    "Pillow==9.5.0" \
+    "scipy==1.4.1"
+
 
 # ---- Stage 2: MITM Gateway --------------------------------------------------
 FROM python:3.11-slim

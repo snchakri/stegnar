@@ -82,11 +82,11 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
         import time
         logger.info("Stream reaper started.")
         while True:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
             now = time.time()
             to_process = []
             for stream_id, data in list(self._streams.items()):
-                if now - data['last_seen'] > 2.0:
+                if now - data['last_seen'] > 5.0:
                     to_process.append((stream_id, data))
                     del self._streams[stream_id]
             
@@ -103,7 +103,7 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
         chunk = data['metadata'] # use the first chunk's metadata for IP/port etc
         
         # Build forensic PCAP and get MinIO URI + Deep Carved Image
-        all_keys = self._key_store.get_keys(stream_id)
+        all_keys = self._key_store.get_keys(data['endpoint_id'])
 
         pcap_uri, carved_image = await self._pcap_builder.build_pcap(
             stream_id, raw_bytes, all_keys, is_list=True, pkt_list=data['chunks']
@@ -199,13 +199,14 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
             if not await self._limiter.is_allowed(chunk.endpoint_id):
                 continue
 
-            # Accumulate keys for this stream
-            self._key_store.add_keys(chunk.stream_id, chunk.ssl_keylog)
+            # Accumulate TLS keys indexed by endpoint (not stream) for global decryption
+            self._key_store.add_keys(chunk.endpoint_id, chunk.ssl_keylog)
 
             if chunk.stream_id not in self._streams:
                 self._streams[chunk.stream_id] = {
                     'chunks': [],
                     'metadata': chunk,
+                    'endpoint_id': chunk.endpoint_id,
                     'last_seen': time.time()
                 }
             

@@ -2,15 +2,10 @@
 pcap_builder.py — Forensic PCAP builder and deep-carver.
 
 Strategy:
-  1. Collect raw IP packet bytes from the stream buffer.
-  2. Strip IP + TCP headers from each packet to extract the TCP payload.
-  3. Concatenate all TCP payloads across all packets in the stream.
-  4. Locate an HTTP response body (after the \r\n\r\n boundary).
-  5. Within the body, search for known image magic bytes (JPEG, PNG, WebP, GIF).
-  6. Write the reassembled packets to a PCAP for forensic archiving.
-
-This approach is independent of tshark and works reliably with Scapy-captured
-IP frames where full TCP session state is not available for tshark reassembly.
+  1. Receive a list of raw IP packets from the stream.
+  2. Write them to a PCAP file using Scapy.
+  3. Use Tshark to decrypt the TLS stream (if keys provided) and export HTTP objects.
+  4. Extract the exported image file.
 """
 
 import asyncio
@@ -18,81 +13,9 @@ import logging
 import os
 import time
 import uuid
+import subprocess
 
 logger = logging.getLogger("stegnar.routing.pcap_builder")
-
-# Image magic signatures (offset 0 within the carved payload)
-_IMAGE_MAGIC = [
-    (b'\xff\xd8\xff', "jpeg"),
-    (b'\x89PNG\r\n',  "png"),
-    (b'RIFF',         "webp"),
-    (b'GIF87a',       "gif"),
-    (b'GIF89a',       "gif"),
-    (b'BM',           "bmp"),
-]
-
-
-def _extract_tcp_payload(raw_ip_bytes: bytes) -> bytes:
-    """
-    Given a raw IPv4 packet (as captured by Scapy bytes(pkt)), return
-    only the TCP/UDP application payload. Returns empty bytes on any error.
-    """
-    try:
-        if len(raw_ip_bytes) < 20:
-            return b""
-        # IP header length is in the lower nibble of the first byte, in 32-bit words
-        ihl = (raw_ip_bytes[0] & 0x0F) * 4
-        protocol = raw_ip_bytes[9]
-        if protocol == 6:  # TCP
-            tcp_start = ihl
-            if len(raw_ip_bytes) < tcp_start + 20:
-                return b""
-            # TCP data offset is upper nibble of byte 12 of TCP header, in 32-bit words
-            data_offset = ((raw_ip_bytes[tcp_start + 12] >> 4) & 0xF) * 4
-            payload_start = tcp_start + data_offset
-            return raw_ip_bytes[payload_start:]
-        elif protocol == 17:  # UDP
-            udp_start = ihl
-            return raw_ip_bytes[udp_start + 8:]
-        return b""
-    except Exception:
-        return b""
-
-
-def _carve_image_from_payloads(payloads: bytes) -> bytes:
-    """
-    Given concatenated TCP payloads from an HTTP stream, find and return
-    the image bytes. Handles HTTP/1.1 responses with Content-Length or
-    chunked transfer. Also handles raw binary data directly.
-    """
-    if not payloads:
-        return b""
-
-    # Try to split at HTTP response body boundary
-    sep = b'\r\n\r\n'
-    idx = payloads.find(sep)
-    body = payloads[idx + 4:] if idx != -1 else payloads
-
-    # Scan for known image magic bytes within the first 8KB of the body
-    scan_limit = min(len(body), 8192)
-    for offset in range(scan_limit):
-        for magic, mime in _IMAGE_MAGIC:
-            if body[offset:offset + len(magic)] == magic:
-                candidate = body[offset:]
-                # For JPEG, trim precisely at end-of-image marker
-                if mime == "jpeg":
-                    eoi = candidate.rfind(b'\xff\xd9')
-                    if eoi != -1:
-                        candidate = candidate[:eoi + 2]
-                # Must be more than a trivially small fragment
-                if len(candidate) > 512:
-                    logger.info(
-                        "Carved %s image: %d bytes at body offset=%d",
-                        mime.upper(), len(candidate), offset
-                    )
-                    return candidate
-    return b""
-
 
 class PcapBuilder:
     def __init__(self, output_dir: str = "/tmp/stegnar_pcaps"):
@@ -130,39 +53,76 @@ class PcapBuilder:
         ts        = int(time.time())
         base      = f"{self.output_dir}/{safe_id}_{ts}_{uid}"
         pcap_path = f"{base}.pcap"
+        key_path  = f"{base}.keys"
+        export_dir = f"{base}_ext"
 
         # Determine packet list
         packets = pkt_list if (is_list and pkt_list) else [raw_bytes]
 
-        # --- 1. Write forensic PCAP (best-effort, non-fatal) ---
+        # 1. Write forensic PCAP
         try:
             from scapy.all import IP, wrpcap
             scapy_pkts = []
             for p in packets:
                 try:
+                    # Sniffer now sends IP bytes, so IP(p) is correct.
                     scapy_pkts.append(IP(p))
                 except Exception:
                     pass
             if scapy_pkts:
                 wrpcap(pcap_path, scapy_pkts)
         except Exception as e:
-            logger.warning("PCAP write failed (non-fatal): %s", e)
+            logger.warning("PCAP write failed: %s", e)
+            return f"error://pcap_fail", b""
 
-        # --- 2. Deep Carve: extract TCP payloads and search for image ---
-        all_payloads = b""
-        for p in packets:
-            all_payloads += _extract_tcp_payload(p)
+        # 2. Write SSL keys if present
+        has_keys = False
+        if ssl_keys and ssl_keys.strip():
+            with open(key_path, "w") as f:
+                f.write(ssl_keys)
+            has_keys = True
+            key_count = len([l for l in ssl_keys.split("\n") if l.strip()])
+            logger.info("TLS keys for stream %s: %d lines", stream_id, key_count)
 
-        if all_payloads:
-            image_bytes = _carve_image_from_payloads(all_payloads)
-            if not image_bytes:
-                logger.debug(
-                    "No image found in stream %s (%d bytes of payload)",
-                    stream_id, len(all_payloads)
-                )
-        else:
-            image_bytes = b""
-            logger.debug("No TCP payload extractable from stream %s", stream_id)
+        # 3. Deep Carve with Tshark
+        image_bytes = b""
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            
+            # Basic Tshark command
+            cmd = ["tshark", "-r", pcap_path]
+            
+            # Add TLS keys if we have them
+            if has_keys:
+                cmd.extend(["-o", f"tls.keylog_file:{key_path}"])
+            
+            # Export HTTP objects (Tshark handles decrypted TLS as HTTP)
+            cmd.extend(["--export-objects", f"http,{export_dir}"])
+            
+            # Run Tshark
+            # We use a timeout to avoid hanging on malformed pcaps
+            proc = subprocess.run(cmd, capture_output=True, timeout=15)
+            
+            if proc.returncode != 0:
+                logger.warning("Tshark exited with code %d: %s", proc.returncode, proc.stderr.decode(errors='ignore'))
+
+            # Check export directory for images
+            files = [os.path.join(export_dir, f) for f in os.listdir(export_dir)]
+            if files:
+                # Find the largest file (usually the image we're looking for)
+                largest_file = max(files, key=os.path.getsize)
+                if os.path.getsize(largest_file) > 1000: # Ignore tiny files/headers
+                    with open(largest_file, "rb") as f:
+                        image_bytes = f.read()
+                    logger.info("Tshark SUCCESS: Carved %d bytes from stream %s", len(image_bytes), stream_id)
+                else:
+                    logger.debug("Tshark exported only small files from %s", stream_id)
+            else:
+                tshark_err = proc.stderr.decode(errors='ignore')[:400]
+                logger.info("Tshark NO objects from %s (keys=%s). stderr: %s", stream_id, has_keys, tshark_err)
+
+        except Exception as e:
+            logger.error("Tshark carving failed for %s: %s", stream_id, e)
 
         uri = f"s3://stegnar-pcaps/{safe_id}_{ts}_{uid}.pcap"
         return uri, image_bytes

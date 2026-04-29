@@ -2,7 +2,7 @@ import numpy as np
 from scipy import misc, io
 from glob import glob
 import random
-from itertools import izip
+pass # izip removed
 from random import random as rand
 from random import shuffle
 

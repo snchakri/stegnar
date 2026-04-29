@@ -121,12 +121,12 @@ def train(model_class, train_gen, valid_gen, train_batch_size, \
         for j in range(0, valid_ds_size, valid_batch_size):
             sess.run([increment_valid])
         _acc_val = sess.run(valid_accuracy_s.mean_variable)
-        print "initial accuracy on validation set:", _acc_val
-        print "evaluation time on validation set:", time.time() - _time, "seconds"
+        print("initial accuracy on validation set:", _acc_val)
+        print("evaluation time on validation set:", time.time() - _time, "seconds")
         valid_accuracy_s.add_summary(sess, writer, start)
         valid_loss_s.add_summary(sess, writer, start)
         sess.run(enable_training_op)
-        print "network will be evaluatd every %i iterations on validation set" % valid_interval
+        print("network will be evaluatd every %i iterations on validation set" % valid_interval)
         for i in xrange(start + 1, max_iter + 1):
             sess.run(train_op)
             if i % train_interval == 0:
@@ -172,7 +172,7 @@ def test_dataset(model_class, gen, batch_size, ds_size, load_path):
             sess.run(increment_op)
         mean_loss, mean_accuracy = sess.run([loss_summary.mean_variable, \
                                              accuracy_summary.mean_variable])
-    print "Accuracy:", mean_accuracy, " | Loss:", mean_loss
+    print("Accuracy:", mean_accuracy, " | Loss:", mean_loss)
 
 
 ### Implementation of Adamax optimizer, taken from : https://github.com/openai/iaf/blob/master/tf_utils/adamax.py
