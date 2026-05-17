@@ -158,6 +158,7 @@ services:
       CALPA_MODEL_TYPE: srnet
       CALPA_LIBS_PATH: /calpa/libs
       CALPA_TIMEOUT_SEC: "120"
+      CALPA_DEVICE: ""
       STEGNAR_ENV: dev
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: "1"
@@ -168,6 +169,13 @@ services:
     networks:
       - stegnar-net
     restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50052'); grpc.channel_ready_future(ch).result(timeout=5)"]
       interval: 10s
@@ -204,6 +212,46 @@ services:
       MINIO_BUCKET_PCAPS: stegnar-pcaps
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: "1"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Transparent MITM Proxy (Mode C)
+  # ===========================================================================
+
+  stegnar-proxy:
+    build:
+      context: .
+      dockerfile: stegnar-proxy/Dockerfile
+    container_name: stegnar-proxy
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    environment:
+      ROUTER_GRPC_ADDR: routing:50051
+    ports:
+      - "8080:8080"
+    volumes:
+      - proxy_data:/app/.mitmproxy
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Installer Server
+  # ===========================================================================
+
+  install-server:
+    build:
+      context: .
+      dockerfile: install-server/Dockerfile
+    container_name: stegnar-install-server
+    ports:
+      - "8081:8080"
+    volumes:
+      - proxy_data:/app/certs:ro
     networks:
       - stegnar-net
     restart: unless-stopped
@@ -310,3 +358,4 @@ volumes:
   redis_data:
   pg_data:
   minio_data:
+  proxy_data:

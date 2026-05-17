@@ -1,0 +1,4 @@
+mitmproxy==9.0.1
+grpcio
+grpcio-tools
+protobuf
