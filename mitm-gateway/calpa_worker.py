@@ -171,9 +171,41 @@ def _softmax2(logits):
     return e1 / (e0 + e1)   # P(stego)
 
 
+def _detect_device():
+    """
+    Return '/GPU:0' if an NVIDIA GPU with CUDA is reachable, else '/CPU:0'.
+
+    Resolution order:
+      1. CALPA_DEVICE env var ("GPU" or "CPU") — explicit override.
+      2. nvidia-smi probe — present means CUDA driver is installed.
+      3. Default: CPU.
+
+    NOTE: We always install tensorflow-gpu so both paths are always available.
+    TF will log a warning (not an error) when /GPU:0 is requested but no
+    CUDA device is found; allow_soft_placement re-routes ops to CPU silently.
+    """
+    import subprocess
+    forced = os.environ.get('CALPA_DEVICE', '').strip().upper()
+    if forced in ('GPU', 'CPU'):
+        chosen = '/' + forced + ':0'
+        print('[calpa_worker] Device override from CALPA_DEVICE: ' + chosen, file=sys.stderr)
+        return chosen
+
+    try:
+        subprocess.check_output(['nvidia-smi'], stderr=subprocess.STDOUT)
+        print('[calpa_worker] nvidia-smi found — using /GPU:0', file=sys.stderr)
+        return '/GPU:0'
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print('[calpa_worker] No NVIDIA GPU detected — falling back to /CPU:0', file=sys.stderr)
+        return '/CPU:0'
+
+
 def run_inference(image_path, model_path, cfg_path):
     import numpy as np
     import tensorflow as tf
+
+    # 0. Device selection (GPU if available, CPU fallback)
+    device = _detect_device()
 
     # 1. Parse pruning config
     thinet_save, l1_save = _read_pruned_channels(cfg_path)
@@ -181,28 +213,33 @@ def run_inference(image_path, model_path, cfg_path):
     # 2. Load image
     img_batch = _load_image(image_path)  # [1, H, W, 1]
 
-    # 3. Build graph
+    # 3. Build graph on selected device
     tf.reset_default_graph()
-    ph_input = tf.placeholder(tf.float32, shape=[None, None, None, 1], name='ph_input')
-    logits_t = _build_pruned_srnet(ph_input, thinet_save, l1_save)
+    with tf.device(device):
+        ph_input = tf.placeholder(tf.float32, shape=[None, None, None, 1], name='ph_input')
+        logits_t = _build_pruned_srnet(ph_input, thinet_save, l1_save)
 
-    # 4. Restore checkpoint
-    saver = tf.train.Saver()
+    # 4. Session config — allow TF to silently re-place ops if a device is unavailable
     tf_cfg = tf.ConfigProto()
-    tf_cfg.gpu_options.allow_growth = True
+    tf_cfg.gpu_options.allow_growth   = True   # don't grab all VRAM upfront
+    tf_cfg.allow_soft_placement       = True   # fallback any op GPU can't run
+    tf_cfg.log_device_placement       = False  # set True to debug placement
 
+    # 5. Restore checkpoint and run inference
+    saver = tf.train.Saver()
     with tf.Session(config=tf_cfg) as sess:
         sess.run(tf.global_variables_initializer())
         saver.restore(sess, model_path)
         logits = sess.run(logits_t, feed_dict={ph_input: img_batch})
 
-    # 5. Decode output
+    # 6. Decode output
     p_stego = _softmax2(logits[0])
     label = 'STEGO' if p_stego >= 0.5 else 'CLEAN'
     return {
         'predicted_label': label,
-        'confidence': float(p_stego),
-        'raw_score': float(logits[0][1])
+        'confidence':      float(p_stego),
+        'raw_score':       float(logits[0][1]),
+        'device':          device,   # report which device was used
     }
 
 
