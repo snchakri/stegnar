@@ -1,0 +1,9 @@
+﻿docker : 2026-04-28 21:06:14,279 [INFO] stegnar.routing.cache ΓÇö Redis cache connected: redis://redis:6379
+At line:1 char:1
++ docker logs stegnar-routing 2> routing_err.log
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-04-28 21:0...is://redis:6379:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-04-28 21:06:14,283 [INFO] stegnar.routing.dispatcher ΓÇö MITM dispatcher connected to mitm:50052
+2026-04-28 21:06:14,284 [INFO] stegnar.routing.main ΓÇö Routing System gRPC server starting on 0.0.0.0:50051

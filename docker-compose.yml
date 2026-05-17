@@ -1,0 +1,312 @@
+services:
+
+  # ===========================================================================
+  # Infrastructure layer
+  # ===========================================================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: stegnar-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: stegnar-postgres
+    environment:
+      POSTGRES_USER: stegnar
+      POSTGRES_PASSWORD: stegnar_secret
+      POSTGRES_DB: stegnar
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./data-layer/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stegnar -d stegnar"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: stegnar-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: stegnar
+      MINIO_ROOT_PASSWORD: stegnar_minio_secret
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # MinIO console
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MinIO bucket initializer (runs once, creates the stegnar-artifacts bucket)
+  minio-init:
+    image: minio/mc:latest
+    container_name: stegnar-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - stegnar-net
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 stegnar stegnar_minio_secret;
+        mc mb --ignore-existing local/stegnar-artifacts;
+        mc mb --ignore-existing local/stegnar-pcaps;
+        echo 'MinIO buckets ready.';
+      "
+    restart: "no"
+
+  # ===========================================================================
+  # Target HTTPS server (victim nodes make requests here)
+  # ===========================================================================
+
+  target-server:
+    build:
+      context: .
+      dockerfile: target-server/Dockerfile
+    container_name: stegnar-target
+    volumes:
+      - ./test_images:/test_images:ro
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://localhost:443/health', context=ctx)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Component 4 — Routing System
+  # ===========================================================================
+
+  routing:
+    build:
+      context: .
+      dockerfile: routing-system/Dockerfile
+    container_name: stegnar-routing
+    depends_on:
+      redis:
+        condition: service_healthy
+      mitm:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      MITM_GRPC_ADDR: mitm:50052
+      GRPC_LISTEN_ADDR: "0.0.0.0:50051"
+      RATE_LIMIT_RPS: "1000"
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "50051:50051"    # gRPC for endpoint agents
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # ===========================================================================
+  # Component 3 — MITM Gateway (privileged, eBPF/XDP)
+  # ===========================================================================
+
+  mitm:
+    build:
+      context: .
+      dockerfile: mitm-gateway/Dockerfile
+    container_name: stegnar-mitm
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      GRPC_LISTEN_ADDR: "0.0.0.0:50052"
+      CALPA_PYTHON_PATH: /opt/tf1/bin/python3.7
+      CALPA_MODEL_PATH: /calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt
+      CALPA_MODEL_TYPE: srnet
+      CALPA_LIBS_PATH: /calpa/libs
+      CALPA_TIMEOUT_SEC: "120"
+      STEGNAR_ENV: dev
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./CALPA-NET-master:/calpa:ro
+    ports:
+      - "50052:50052"    # gRPC for routing system
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50052'); grpc.channel_ready_future(ch).result(timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ===========================================================================
+  # Component 2 — Data Layer (Redis consumer → DB + MinIO)
+  # ===========================================================================
+
+  data-layer:
+    build:
+      context: .
+      dockerfile: data-layer/Dockerfile
+    container_name: stegnar-data-layer
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_STREAM: stegnar:db_queue
+      POSTGRES_DSN: "postgresql://stegnar:stegnar_secret@postgres:5432/stegnar"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: stegnar
+      MINIO_SECRET_KEY: stegnar_minio_secret
+      MINIO_BUCKET_ARTIFACTS: stegnar-artifacts
+      MINIO_BUCKET_PCAPS: stegnar-pcaps
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Component 1 — Endpoint Agents (Nodes 1-4)
+  # ===========================================================================
+
+  node-1:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-1
+    depends_on:
+      routing:
+        condition: service_healthy
+    environment:
+      ENDPOINT_ID: node-1
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      TARGET_URL: "http://target-server/cover_test00001.jpg"
+      LOG_LEVEL: INFO
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-2:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-2
+    depends_on:
+      routing:
+        condition: service_healthy
+    environment:
+      ENDPOINT_ID: node-2
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SSLKEYLOGFILE: /tmp/keys.log
+      TARGET_URL: "https://target-server/cover_test00002.jpg"
+      LOG_LEVEL: INFO
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-3:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-3
+    depends_on:
+      routing:
+        condition: service_healthy
+    environment:
+      ENDPOINT_ID: node-3
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SSLKEYLOGFILE: /tmp/keys.log
+      TARGET_URL: "https://target-server/stego1_test00001.jpg"
+      LOG_LEVEL: INFO
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-4:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-4
+    depends_on:
+      routing:
+        condition: service_healthy
+    environment:
+      ENDPOINT_ID: node-4
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SSLKEYLOGFILE: /tmp/keys.log
+      TARGET_URL: "https://target-server/stego2_test00002.jpg"
+      LOG_LEVEL: INFO
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+# ===========================================================================
+# Shared network and volumes
+# ===========================================================================
+
+networks:
+  stegnar-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  redis_data:
+  pg_data:
+  minio_data:

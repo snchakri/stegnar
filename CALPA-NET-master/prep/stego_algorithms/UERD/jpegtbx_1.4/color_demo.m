@@ -1,0 +1,59 @@
+clear all
+close all
+clc
+
+% 质量因子
+QF = 75;
+input_img = 'color.bmp';
+output_img = 'color.jpg';
+
+% 导入JPEG结构体
+load default_color_jpeg_obj;
+
+% 计算量化矩阵
+quan_table_Y = jpeg_qtable(QF,0);
+quan_table_Cb = jpeg_qtable(QF,1);
+default_color_jpeg_obj.quant_tables{1} = quan_table_Y;
+default_color_jpeg_obj.quant_tables{2} = quan_table_Cb;
+
+%读取彩色BMP图像，提取三通道颜色分量 
+img = imread(input_img);
+% R = double(img(:,:,1));
+% G = double(img(:,:,2));
+% B = double(img(:,:,3));
+% 
+% % 将RGB转成YCbCr，JPEG格式标准
+% Y = 0.2990*R+0.5870*G+0.1140*B;
+% Cb = -0.1687*R-0.3313*G+0.5000*B+128;
+% Cr = 0.5000*R-0.4187*G-0.0813*B+128;
+img = rgb2ycbcr(img);
+Y = double(img(:,:,1));
+Cb = double(img(:,:,2));
+Cr = double(img(:,:,3));
+% DCT变换
+jpg_dct_Y = bdct(Y-128);
+jpg_dct_Cb = bdct(Cb-128);
+jpg_dct_Cr = bdct(Cr-128);
+
+% 量化，Cb、Cr使用相同的量化矩阵
+jpg_dct_Y = quantize(jpg_dct_Y,quan_table_Y);
+jpg_dct_Cb = quantize(jpg_dct_Cb,quan_table_Cb);
+jpg_dct_Cr = quantize(jpg_dct_Cr,quan_table_Cb);
+
+% 取整
+jpg_dct_Y = round(jpg_dct_Y);
+jpg_dct_Cb = round(jpg_dct_Cb);
+jpg_dct_Cr = round(jpg_dct_Cr);
+
+% 宽度、高度、DCT系数写入JPEG结构体
+[img_h img_w] = size(jpg_dct_Y);
+default_color_jpeg_obj.image_width = img_w;
+default_color_jpeg_obj.image_height = img_h;
+default_color_jpeg_obj.coef_arrays{1} = jpg_dct_Y;
+default_color_jpeg_obj.coef_arrays{2} = jpg_dct_Cb;
+default_color_jpeg_obj.coef_arrays{3} = jpg_dct_Cr;
+
+% JPEG熵编码，创建JPEG图像
+jpeg_write(default_color_jpeg_obj,output_img);
+imshow(output_img)
+

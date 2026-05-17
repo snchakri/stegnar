@@ -1,0 +1,64 @@
+syntax = "proto3";
+package stegnar;
+
+option py_generic_services = true;
+
+// ===========================================================================
+// RouterService  —  Endpoint Agent → Routing System
+// Unidirectional client-streaming: agent streams chunks, router acks at end.
+// ===========================================================================
+service RouterService {
+  rpc StreamPayload (stream PayloadChunk) returns (StreamAck) {}
+}
+
+// ===========================================================================
+// AnalysisService  —  Routing System → MITM Gateway
+// Router dispatches a carved image; gateway returns CALPA-NET result.
+// ===========================================================================
+service AnalysisService {
+  rpc AnalyzeImage (AnalysisRequest) returns (AnalysisResult) {}
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint → Router messages
+// ---------------------------------------------------------------------------
+message PayloadChunk {
+  string endpoint_id  = 1;   // e.g. "victim-a"
+  string stream_id    = 2;   // unique per TCP connection
+  bytes  raw_bytes    = 3;   // raw captured packet payload bytes
+  string sha256       = 4;   // SHA-256 hex of raw_bytes
+  string ssl_keylog   = 5;   // SSLKEYLOGFILE lines for this stream (if any)
+  string src_ip       = 6;
+  string dst_ip       = 7;
+  uint32 src_port     = 8;
+  uint32 dst_port     = 9;
+  int64  captured_at  = 10;  // Unix epoch ms
+}
+
+message StreamAck {
+  bool   ok           = 1;
+  uint64 chunks_recv  = 2;
+  string message      = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Router → MITM Gateway messages
+// ---------------------------------------------------------------------------
+message AnalysisRequest {
+  string stream_id    = 1;
+  bytes  image_bytes  = 2;   // carved image binary
+  string sha256       = 3;   // SHA-256 of image_bytes
+  string endpoint_id  = 4;
+  string src_ip       = 5;
+  string dst_ip       = 6;
+}
+
+message AnalysisResult {
+  string stream_id    = 1;
+  string verdict      = 2;   // "CLEAN" | "STEGO" | "AMBIGUOUS" | "ERROR"
+  float  confidence   = 3;   // 0.0–1.0  P(stego)
+  float  raw_score    = 4;   // raw logit[1]
+  string model_type   = 5;   // "srnet"
+  uint32 latency_ms   = 6;
+  string error        = 7;   // set only on verdict == "ERROR"
+}

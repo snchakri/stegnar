@@ -1,0 +1,31 @@
+services:
+  calpa-probe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stegnar/calpa-probe:latest
+    container_name: calpa-probe
+    ports:
+      - "8080:8080"
+    volumes:
+      # TF1 model checkpoint files
+      - ../CALPA-NET-master/generated_cfg_and_model/trained_pruned_model:/models:ro
+      # CALPA libs (SRNet.py, psm/, etc.)
+      - ../CALPA-NET-master/libs:/calpa/libs:ro
+      # Test images to scan (put your images here)
+      - ../test_images:/images:ro
+    environment:
+      - CALPA_PYTHON_PATH=/opt/tf1/bin/python
+      - CALPA_MODEL_PATH=/models/Model_438375.ckpt
+      - CALPA_MODEL_TYPE=srnet
+      - CALPA_LIBS_PATH=/calpa/libs
+      - CALPA_TIMEOUT_SEC=120
+      - FLASK_ENV=development
+      - PYTHONUNBUFFERED=1
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
