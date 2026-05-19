@@ -32,6 +32,7 @@ from dispatcher   import MITMDispatcher
 from queue_writer import QueueWriter
 from pcap_builder import PcapBuilder
 from key_store    import KeyStore
+import pg_writer  # for endpoint_registry + hash_cache writes
 
 logger = logging.getLogger("stegnar.routing.servicer")
 
@@ -39,7 +40,7 @@ logger = logging.getLogger("stegnar.routing.servicer")
 _IMAGE_MAGIC = {
     b'\xff\xd8\xff':   "jpeg",
     b'\x89PNG\r\n':    "png",
-    b'RIFF':           "webp",  # needs additional check at offset 8
+    b'RIFF':           "webp",
     b'BM':             "bmp",
     b'GIF87a':         "gif",
     b'GIF89a':         "gif",
@@ -50,6 +51,7 @@ def _sniff_image(raw_bytes: bytes) -> bool:
     """Return True if raw_bytes starts with a known image magic signature."""
     for magic in _IMAGE_MAGIC:
         if raw_bytes[:len(magic)] == magic:
+            logger.debug("[Servicer] MIME sniff match: %s", _IMAGE_MAGIC[magic])
             return True
     return False
 
@@ -71,108 +73,165 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
         self._key_store    = KeyStore()
         self._streams      = {}
         self._reaper_task  = None
+        logger.info("[Servicer] RouterServicer initialized.")
 
     async def start(self):
         """Start background tasks. Must be called inside the asyncio event loop."""
         loop = asyncio.get_running_loop()
         self._reaper_task = loop.create_task(self._reaper(), name="stream-reaper")
-        logger.info("RouterServicer started — stream reaper is running.")
+        logger.info("[Servicer] RouterServicer started — stream reaper is running.")
 
     async def _reaper(self):
-        import time
-        logger.info("Stream reaper started.")
+        logger.info("[Servicer] Stream reaper started.")
         while True:
             await asyncio.sleep(5.0)
             now = time.time()
             to_process = []
             for stream_id, data in list(self._streams.items()):
-                if now - data['last_seen'] > 5.0:
+                age = now - data['last_seen']
+                if age > 5.0:
                     to_process.append((stream_id, data))
                     del self._streams[stream_id]
-            
+
             if to_process:
-                logger.info("Reaper flushing %d idle stream(s).", len(to_process))
+                logger.info("[Servicer] Reaper flushing %d idle stream(s).", len(to_process))
             for stream_id, data in to_process:
                 try:
                     await self._process_stream(stream_id, data)
                 except Exception as e:
-                    logger.error("Error processing stream %s: %s", stream_id, e)
+                    logger.error("[Servicer] Reaper error for stream=%s: %s", stream_id, e, exc_info=True)
 
     async def _process_stream(self, stream_id: str, data: dict):
-        raw_bytes = b"".join(data['chunks'])
-        chunk = data['metadata'] # use the first chunk's metadata for IP/port etc
-        
-        # Build forensic PCAP and get MinIO URI + Deep Carved Image
-        all_keys = self._key_store.get_keys(data['endpoint_id'])
+        raw_bytes   = b"".join(data['chunks'])
+        chunk       = data['metadata']
+        endpoint_id = data['endpoint_id']
 
-        pcap_uri, carved_image = await self._pcap_builder.build_pcap(
-            stream_id, raw_bytes, all_keys, is_list=True, pkt_list=data['chunks']
+        logger.info(
+            "[Servicer] Processing stream=%s endpoint=%s total_bytes=%d chunks=%d",
+            stream_id, endpoint_id, len(raw_bytes), len(data['chunks']),
         )
 
-        # Cache lookup
-        cached = await self._cache.lookup(chunk.sha256)
+        # ── Upsert endpoint registry ──────────────────────────────────────────
+        await pg_writer.upsert_endpoint(
+            endpoint_id=endpoint_id,
+            ip_address=chunk.src_ip or chunk.dst_ip or "",
+            bytes_delta=len(raw_bytes),
+        )
+
+        # ── Build forensic PCAP + upload artifacts ────────────────────────────
+        all_keys = self._key_store.get_keys(endpoint_id)
+        logger.debug(
+            "[Servicer] SSL keys available for endpoint=%s: %d chars",
+            endpoint_id, len(all_keys) if all_keys else 0,
+        )
+
+        pcap_uri, image_uri, carved_image = await self._pcap_builder.build_pcap(
+            stream_id, raw_bytes, all_keys, is_list=True, pkt_list=data['chunks']
+        )
+        logger.info(
+            "[Servicer] PCAP build result stream=%s pcap_uri=%s image_uri=%s carved=%d bytes",
+            stream_id, pcap_uri or "none", image_uri or "none", len(carved_image),
+        )
+
+        # ── SHA-256 of reassembled payload for cache lookup ───────────────────
+        full_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        logger.debug("[Servicer] SHA256 stream=%s hash=%s", stream_id, full_sha256[:16])
+
+        # ── Cache lookup ──────────────────────────────────────────────────────
+        cached = await self._cache.lookup(full_sha256)
         if cached is not None:
             logger.info(
-                "CACHE HIT  endpoint=%s stream=%s sha=%s verdict=%s",
-                chunk.endpoint_id, stream_id, chunk.sha256[:12], cached["verdict"]
+                "[Servicer] CACHE HIT endpoint=%s stream=%s sha=%s verdict=%s",
+                endpoint_id, stream_id, full_sha256[:12], cached["verdict"],
+            )
+            await pg_writer.store_hash_cache(
+                sha256=full_sha256,
+                verdict=cached["verdict"],
+                steg_score=cached["steg_score"],
             )
             await self._queue.write_event(
                 stream_id   = stream_id,
-                endpoint_id = chunk.endpoint_id,
-                sha256      = chunk.sha256,
+                endpoint_id = endpoint_id,
+                sha256      = full_sha256,
                 verdict     = "CACHE_HIT",
                 steg_score  = cached["steg_score"],
                 src_ip      = chunk.src_ip,
                 dst_ip      = chunk.dst_ip,
                 bytes_total = len(raw_bytes),
                 pcap_uri    = pcap_uri,
+                image_uri   = image_uri,
             )
             return
 
-        # Image Determination (MIME sniff OR Deep Carved)
+        # ── Image determination (MIME sniff OR tshark-carved) ─────────────────
         image_bytes_to_analyze = b""
         if _sniff_image(raw_bytes):
             image_bytes_to_analyze = raw_bytes
+            logger.info(
+                "[Servicer] Direct image payload detected stream=%s bytes=%d",
+                stream_id, len(raw_bytes),
+            )
         elif carved_image:
             image_bytes_to_analyze = carved_image
+            logger.info(
+                "[Servicer] Using tshark-carved image stream=%s bytes=%d",
+                stream_id, len(carved_image),
+            )
 
         if not image_bytes_to_analyze:
+            logger.info(
+                "[Servicer] NO_IMAGE for stream=%s endpoint=%s — queuing metadata only",
+                stream_id, endpoint_id,
+            )
             await self._queue.write_event(
                 stream_id   = stream_id,
-                endpoint_id = chunk.endpoint_id,
-                sha256      = chunk.sha256,
+                endpoint_id = endpoint_id,
+                sha256      = full_sha256,
                 verdict     = "NO_IMAGE",
                 steg_score  = 0.0,
                 src_ip      = chunk.src_ip,
                 dst_ip      = chunk.dst_ip,
                 bytes_total = len(raw_bytes),
                 pcap_uri    = pcap_uri,
+                image_uri   = image_uri,
             )
             return
 
-        # Dispatch to MITM Gateway for CALPA-NET analysis
+        # ── Dispatch to MITM Gateway for CALPA-NET analysis ───────────────────
         logger.info(
-            "DISPATCHING image endpoint=%s stream=%s sha=%s bytes=%d",
-            chunk.endpoint_id, stream_id, chunk.sha256[:12], len(image_bytes_to_analyze)
+            "[Servicer] DISPATCHING to MITM endpoint=%s stream=%s sha=%s bytes=%d",
+            endpoint_id, stream_id, full_sha256[:12], len(image_bytes_to_analyze),
         )
         result = await self._dispatcher.analyze(
             stream_id   = stream_id,
             image_bytes = image_bytes_to_analyze,
-            sha256      = chunk.sha256,
-            endpoint_id = chunk.endpoint_id,
+            sha256      = full_sha256,
+            endpoint_id = endpoint_id,
             src_ip      = chunk.src_ip,
             dst_ip      = chunk.dst_ip,
         )
+        logger.info(
+            "[Servicer] CALPA result stream=%s verdict=%s confidence=%.4f latency=%dms model=%s",
+            stream_id, result.verdict, result.confidence,
+            result.latency_ms or 0, result.model_type or "srnet",
+        )
 
-        # Store in cache (even errors, to avoid re-dispatching)
+        # ── Store in Redis cache ───────────────────────────────────────────────
         if result.verdict not in ("ERROR",):
-            await self._cache.store(chunk.sha256, result.verdict, result.confidence)
+            await self._cache.store(full_sha256, result.verdict, result.confidence)
+            # Also persist to PostgreSQL hash_cache for SOC visibility
+            await pg_writer.store_hash_cache(
+                sha256     = full_sha256,
+                verdict    = result.verdict,
+                steg_score = result.confidence,
+                model_type = result.model_type or "srnet",
+            )
 
-        # Write to event queue
+        # ── Write event to Redis queue → data-layer → PostgreSQL ──────────────
         await self._queue.write_event(
             stream_id   = stream_id,
-            endpoint_id = chunk.endpoint_id,
-            sha256      = chunk.sha256,
+            endpoint_id = endpoint_id,
+            sha256      = full_sha256,
             verdict     = result.verdict,
             steg_score  = result.confidence,
             src_ip      = chunk.src_ip,
@@ -181,40 +240,73 @@ class RouterServicer(pb_grpc.RouterServiceServicer):
             latency_ms  = result.latency_ms,
             model_type  = result.model_type or "srnet",
             pcap_uri    = pcap_uri,
+            image_uri   = image_uri,
         )
 
         logger.info(
-            "ANALYSIS DONE endpoint=%s stream=%s verdict=%s confidence=%.3f",
-            chunk.endpoint_id, stream_id, result.verdict, result.confidence
+            "[Servicer] ANALYSIS DONE endpoint=%s stream=%s verdict=%s score=%.4f pcap=%s img=%s",
+            endpoint_id, stream_id, result.verdict, result.confidence,
+            pcap_uri or "none", image_uri or "none",
         )
 
     async def StreamPayload(self, request_iterator, context):  # noqa: N802
-        import time
         chunks_recv = 0
+        touched_streams = set()
 
         async for chunk in request_iterator:
             chunks_recv += 1
 
             # Rate limit
             if not await self._limiter.is_allowed(chunk.endpoint_id):
+                logger.warning(
+                    "[Servicer] Rate limit exceeded endpoint=%s — dropping chunk",
+                    chunk.endpoint_id,
+                )
                 continue
 
-            # Accumulate TLS keys indexed by endpoint (not stream) for global decryption
-            self._key_store.add_keys(chunk.endpoint_id, chunk.ssl_keylog)
+            # Accumulate TLS keys indexed by endpoint
+            if chunk.ssl_keylog:
+                self._key_store.add_keys(chunk.endpoint_id, chunk.ssl_keylog)
+                logger.debug(
+                    "[Servicer] SSL keylog updated for endpoint=%s (%d bytes)",
+                    chunk.endpoint_id, len(chunk.ssl_keylog),
+                )
 
             if chunk.stream_id not in self._streams:
                 self._streams[chunk.stream_id] = {
-                    'chunks': [],
-                    'metadata': chunk,
+                    'chunks':      [],
+                    'metadata':    chunk,
                     'endpoint_id': chunk.endpoint_id,
-                    'last_seen': time.time()
+                    'last_seen':   time.time(),
                 }
-            
+                logger.debug(
+                    "[Servicer] New stream registered: stream_id=%s endpoint=%s",
+                    chunk.stream_id, chunk.endpoint_id,
+                )
+
             self._streams[chunk.stream_id]['chunks'].append(chunk.raw_bytes)
             self._streams[chunk.stream_id]['last_seen'] = time.time()
+            touched_streams.add(chunk.stream_id)
+
+        logger.info(
+            "[Servicer] StreamPayload RPC complete — chunks_recv=%d streams=%d",
+            chunks_recv, len(touched_streams),
+        )
+
+        # Force process all streams touched by this connection before returning
+        for stream_id in touched_streams:
+            if stream_id in self._streams:
+                data = self._streams.pop(stream_id)
+                try:
+                    await self._process_stream(stream_id, data)
+                except Exception as e:
+                    logger.error(
+                        "[Servicer] Error processing stream=%s on disconnect: %s",
+                        stream_id, e, exc_info=True,
+                    )
 
         return pb.StreamAck(
             ok=True,
             chunks_recv=chunks_recv,
-            message=f"processed {chunks_recv} chunks"
+            message=f"processed {chunks_recv} chunks",
         )

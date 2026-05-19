@@ -1,5 +1,6 @@
 // src/lib/websocket.ts
 
+import { WS_URL } from './config'
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -9,7 +10,7 @@ export function initWebSocket(onNewImage: (img: any) => void) {
   if (reconnectTimer) clearTimeout(reconnectTimer)
 
   try {
-    ws = new WebSocket('ws://localhost:3001/ws/events')
+    ws = new WebSocket(WS_URL)
 
     ws.onopen = () => {
       console.log('[WS] Connected to SOC event stream')

@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router';
 import { TopBar } from '../components/TopBar';
+import { apiUrl } from '../../lib/config';
 import { Search, X } from 'lucide-react';
 
 interface LogRow {
@@ -27,7 +28,7 @@ export function LogsPage() {
     if (compFilter !== 'all') params.set('component', compFilter);
     if (search)               params.set('search', search);
 
-    fetch(`http://localhost:3001/api/logs?${params}`)
+    fetch(apiUrl(`/logs?${params}`))
       .then(r => r.json())
       .then((data: LogRow[]) => {
         setLogs(data);

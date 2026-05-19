@@ -73,7 +73,7 @@ async def serve():
     await pg.connect()
 
     stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _stop():
         logger.info("Shutdown signal received.")

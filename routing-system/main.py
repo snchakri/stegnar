@@ -23,6 +23,7 @@ from rate_limiter import RateLimiter
 from dispatcher   import MITMDispatcher
 from queue_writer import QueueWriter
 from servicer     import RouterServicer
+import pg_writer
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -43,9 +44,12 @@ async def serve():
     cache   = HashCache()
     limiter = RateLimiter()
     queue   = QueueWriter()
-    await cache.connect()
+    await cache.connect(redis_client)
     await limiter.connect(redis_client)
     await queue.connect(redis_client)
+
+    # 2b. Initialize PostgreSQL writer (endpoint_registry + hash_cache)
+    await pg_writer.init_pool()
 
     dispatcher = MITMDispatcher()
     await dispatcher.connect()
@@ -68,7 +72,7 @@ async def serve():
     await server.start()
 
     # Graceful shutdown handling
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
     def _stop():
@@ -84,6 +88,7 @@ async def serve():
     await server.stop(grace=5)
     await dispatcher.close()
     await cache.close()
+    await pg_writer.close_pool()
     await redis_client.aclose()
     logger.info("Routing System stopped cleanly.")
 

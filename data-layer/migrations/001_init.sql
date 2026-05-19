@@ -5,6 +5,7 @@
 
 -- Enable UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
 -- =============================================================================
 -- network_events — primary forensic ledger (TimescaleDB hypertable)

@@ -11,6 +11,7 @@ import { TopologyPage } from './pages/TopologyPage';
 import { LogsPage } from './pages/LogsPage';
 import { LedgerTrail } from './pages/LedgerTrail';
 import { SettingsPage } from './pages/SettingsPage';
+import { ProxyPage } from './pages/ProxyPage';
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -27,6 +28,7 @@ export default function App() {
               <Route path="/database"    element={<DatabasePage />} />
               <Route path="/redis"       element={<RedisPage />} />
               <Route path="/images"      element={<ImageFeed />} />
+              <Route path="/proxy"       element={<ProxyPage />} />
               <Route path="/ingest"      element={<IngestPage />} />
               <Route path="/storage"     element={<StoragePage />} />
               <Route path="/performance" element={<PerformancePage />} />

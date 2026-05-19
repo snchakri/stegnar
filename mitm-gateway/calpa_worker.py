@@ -41,8 +41,14 @@ def _read_pruned_channels(cfg_path):
 
     Returns (thinet_keep, l1_keep) as lists indexed from layer 3 onward.
     """
+    import os
+    if not os.path.isfile(cfg_path):
+        raise FileNotFoundError("Pruning config file not found: " + cfg_path)
+
     cfg = configparser.RawConfigParser()
     cfg.read(cfg_path)
+    if not cfg.sections():
+        raise ValueError("Config file is empty or invalid: " + cfg_path)
 
     # Thinet keep-rates for layers 3..12 (10 entries, index 0=L3, 9=L12)
     thinet_save = []
@@ -252,6 +258,9 @@ def main():
         sys.exit(1)
 
     try:
+        if 'cfg_path' not in req:
+            raise ValueError("Invalid schema: 'cfg_path' missing. (Wrong worker script?)")
+        
         image_path = req['image_path']
         model_path = req['model_path']
         cfg_path   = req['cfg_path']

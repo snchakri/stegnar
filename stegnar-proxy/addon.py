@@ -17,7 +17,7 @@ class StegnarAddon:
         self.queue = asyncio.Queue()
         self.task = None
 
-    def load(self, loader):
+    def running(self):
         self.task = asyncio.create_task(self.stream_worker())
 
     async def stream_worker(self):
@@ -63,7 +63,7 @@ class StegnarAddon:
                         dst_ip=server_ip,
                         src_port=client_port,
                         dst_port=server_port,
-                        captured_at=int(time.time()),
+                        captured_at=int(time.time() * 1000),
                     )
                     
                     self.queue.put_nowait(chunk)

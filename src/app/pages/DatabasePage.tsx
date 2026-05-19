@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Search, RefreshCw, ChevronLeft, ChevronRight, X } from 'lucide-react';
 import { TopBar } from '../components/TopBar';
+import { apiUrl } from '../../lib/config';
 
 // Real tables that exist in your schema
 const REAL_TABLES = [
@@ -35,7 +36,7 @@ export function DatabasePage() {
 
   // Fetch table metadata (row counts)
   useEffect(() => {
-    fetch('http://localhost:3001/api/db/tables')
+    fetch(apiUrl('/db/tables'))
       .then(r => r.json())
       .then((tables: any[]) => {
         const meta: Record<string, any> = {};
@@ -50,7 +51,7 @@ export function DatabasePage() {
     setLoading(true);
     setPage(1);
     setSelectedRow(null);
-    fetch(`http://localhost:3001/api/db/tables/${selectedTable}/rows?limit=100`)
+    fetch(apiUrl(`/db/tables/${selectedTable}/rows?limit=100`))
       .then(r => r.json())
       .then(data => { setRows(data); setLoading(false); })
       .catch(() => { setLoading(false); });
@@ -140,7 +141,7 @@ export function DatabasePage() {
                 style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)', color: 'var(--text-primary)', fontSize: 'var(--text-sm)' }}
               />
             </div>
-            <button onClick={() => { setLoading(true); fetch(`http://localhost:3001/api/db/tables/${selectedTable}/rows?limit=100`).then(r=>r.json()).then(d=>{setRows(d);setLoading(false);}).catch(()=>setLoading(false)); }}
+            <button onClick={() => { setLoading(true); fetch(apiUrl(`/db/tables/${selectedTable}/rows?limit=100`)).then(r=>r.json()).then(d=>{setRows(d);setLoading(false);}).catch(()=>setLoading(false)); }}
               className="p-2 rounded-lg border" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} style={{ color: 'var(--text-secondary)' }} />
             </button>
@@ -154,7 +155,7 @@ export function DatabasePage() {
                     <tr style={{ background: 'var(--bg-sidebar)', borderBottom: '1px solid var(--border-default)' }}>
                       {columns.map(col => (
                         <th key={col} style={{ padding: '10px 14px', textAlign: 'left', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
-                          {col}
+                          {col.replace(/_/g, ' ')}
                         </th>
                       ))}
                     </tr>

@@ -1,19 +1,24 @@
 """
 main.py — Endpoint Agent entry point.
 
-Runs three concurrent async tasks:
-  1. capture_loop  — Scapy raw packet sniffer → pkt_queue
-  2. watch_keylog  — SSLKEYLOGFILE tail-follower → key_queue
-  3. stream_to_router — gRPC unidirectional stream to Routing System
+Runs concurrent async tasks:
+  1. capture_loop     — Scapy raw packet sniffer → pkt_queue
+  2. watch_keylog     — SSLKEYLOGFILE tail-follower → key_queue
+  3. stream_to_router — Cyclic gRPC stream to Routing System (connect→stream→disconnect→repeat)
+  4. fetch_loop       — Periodic HTTP/S image fetcher (runs forever, refetches every FETCH_INTERVAL)
 
-On SIGTERM/SIGINT, sets stop_event and waits for all tasks to finish.
+Tasks run until SIGTERM/SIGINT.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
-import sys
+import socket as _sock
+import subprocess
+import tempfile
+import time as _time
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -21,13 +26,89 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stegnar.agent")
 
-from sniffer      import capture_loop
+from sniffer       import capture_loop, CapturedPacket
 from key_extractor import watch_keylog
 from grpc_client   import stream_to_router
 
-IFACE       = os.environ.get("CAPTURE_IFACE",  "eth0")
-KEYLOG_PATH = os.environ.get("SSLKEYLOGFILE",  "/tmp/ssl_keys.log")
-QUEUE_SIZE  = 1000
+IFACE          = os.environ.get("CAPTURE_IFACE",   "eth0")
+KEYLOG_PATH    = os.environ.get("SSLKEYLOGFILE",   "/tmp/ssl_keys.log")
+TARGET_URL     = os.environ.get("TARGET_URL",       "")
+ENDPOINT_ID    = os.environ.get("ENDPOINT_ID",      "unknown")
+SOC_API_URL    = os.environ.get("SOC_API_URL",      "http://soc-api:3001")
+FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", "25"))  # seconds between fetches
+QUEUE_SIZE     = 1000
+
+
+async def heartbeat_loop(stop_event: asyncio.Event):
+    """
+    Sends a heartbeat POST to the SOC API every 15s so endpoint_registry
+    is populated immediately — even before the first gRPC cycle completes.
+    """
+    import urllib.request, json as _json
+    url = f"{SOC_API_URL}/api/agents/heartbeat"
+
+    # Resolve own IP
+    try:
+        my_ip = _sock.gethostbyname(_sock.gethostname())
+    except Exception:
+        my_ip = "unknown"
+
+    hb_no = 0
+    while not stop_event.is_set():
+        hb_no += 1
+        try:
+            body = _json.dumps({"endpoint_id": ENDPOINT_ID, "ip": my_ip}).encode()
+            req  = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = _json.loads(resp.read())
+            logger.debug("[heartbeat] #%d → %s ok=%s", hb_no, url, result.get("ok"))
+        except Exception as e:
+            logger.warning("[heartbeat] #%d failed: %s", hb_no, e)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+
+
+async def fetch_loop(pkt_queue: asyncio.Queue, stop_event: asyncio.Event):
+    """
+    Perform a single POST upload of IMAGE_FILE to TARGET_URL.
+    """
+    IMAGE_FILE = os.environ.get("IMAGE_FILE", "")
+    if not TARGET_URL or not IMAGE_FILE:
+        logger.info("[fetch_loop] No TARGET_URL or IMAGE_FILE set — idle.")
+        await stop_event.wait()
+        return
+
+    logger.info("[fetch_loop] Starting single upload — file=%s target=%s", IMAGE_FILE, TARGET_URL)
+
+    # Initial warm-up delay so routing comes fully online
+    await asyncio.sleep(12)
+
+    try:
+        env = os.environ.copy()
+        env["SSLKEYLOGFILE"] = KEYLOG_PATH
+
+        proc = subprocess.run(
+            ["curl", "-s", "-S", "-k", "-X", "POST", "-H", "Content-Type: image/jpeg", "--data-binary", f"@{IMAGE_FILE}", TARGET_URL],
+            env=env, capture_output=True, timeout=15,
+        )
+        logger.info(
+            "[fetch_loop] Upload completed. rc=%d stdout=%s stderr=%s",
+            proc.returncode, proc.stdout.decode()[:100], proc.stderr.decode(errors="ignore")[:200],
+        )
+
+    except subprocess.TimeoutExpired:
+        logger.error("[fetch_loop] Upload TIMED OUT for %s", TARGET_URL)
+    except Exception as e:
+        logger.error("[fetch_loop] Upload error: %s", e, exc_info=True)
+
+    # After single upload, just wait forever so sniffer and gRPC stay alive
+    logger.info("[fetch_loop] Upload finished. Waiting for shutdown.")
+    await stop_event.wait()
 
 
 async def main():
@@ -38,114 +119,33 @@ async def main():
     loop = asyncio.get_event_loop()
 
     def _handle_signal():
-        logger.info("Shutdown signal received.")
+        logger.info("[Agent] Shutdown signal received.")
         stop_event.set()
 
     loop.add_signal_handler(signal.SIGTERM, _handle_signal)
     loop.add_signal_handler(signal.SIGINT,  _handle_signal)
 
     logger.info(
-        "Endpoint Agent starting — id=%s iface=%s keylog=%s",
-        os.environ.get("ENDPOINT_ID", "?"), IFACE, KEYLOG_PATH
+        "[Agent] Starting — id=%s iface=%s keylog=%s target=%s fetch_interval=%ds",
+        ENDPOINT_ID, IFACE, KEYLOG_PATH, TARGET_URL or "(none)", FETCH_INTERVAL,
     )
 
-    TARGET_URL = os.environ.get("TARGET_URL")
-
-    async def auto_fetch():
-        if not TARGET_URL:
-            return
-        logger.info("Auto-fetch task sleeping for 15s to allow system warmup...")
-        await asyncio.sleep(15)
-        logger.info("Executing auto-fetch for %s", TARGET_URL)
-        import subprocess, tempfile, hashlib, struct, time as _time
-        try:
-            env = os.environ.copy()
-            env["SSLKEYLOGFILE"] = KEYLOG_PATH
-
-            if TARGET_URL.startswith("https://"):
-                # For HTTPS: curl saves the response body to a temp file.
-                # We then inject those raw image bytes as a synthetic packet so
-                # Tshark doesn't need to decrypt — the node already has plaintext.
-                fd, tmp_img = tempfile.mkstemp(suffix=".jpg")
-                os.close(fd)
-                cmd = f"curl -sk -o {tmp_img} {TARGET_URL}"
-                subprocess.run(cmd, shell=True, executable="/bin/bash", env=env)
-
-                with open(tmp_img, "rb") as f:
-                    img_bytes = f.read()
-                os.unlink(tmp_img)
-
-                if len(img_bytes) > 1000:
-                    sha = hashlib.sha256(img_bytes).hexdigest()
-                    # Inject as a synthetic captured-packet wrapping the raw image.
-                    # stream_id uses the target host:443 pair so routing can identify it.
-                    from sniffer import CapturedPacket
-                    import socket as _sock
-                    try:
-                        target_ip = _sock.gethostbyname("target-server")
-                    except Exception:
-                        target_ip = "0.0.0.0"
-                    try:
-                        my_ip = _sock.gethostbyname(_sock.gethostname())
-                    except Exception:
-                        my_ip = os.environ.get("ENDPOINT_ID", "unknown")
-
-                    pkt = CapturedPacket(
-                        raw_bytes=img_bytes,
-                        sha256=sha,
-                        src_ip=target_ip,
-                        dst_ip=my_ip,        # unique per node → unique stream_id
-                        src_port=443,
-                        dst_port=int(sha[:4], 16) % 60000 + 1024,  # deterministic unique port
-                        captured_at=int(_time.time()),
-                    )
-                    await pkt_queue.put(pkt)
-                    logger.info("HTTPS auto-fetch: injected %d bytes for analysis.", len(img_bytes))
-                else:
-                    logger.warning("HTTPS auto-fetch: empty or too-small response from %s", TARGET_URL)
-
-            else:
-                # HTTP: just trigger the download; the sniffer captures it live
-                cmd = f"curl -s -o /dev/null {TARGET_URL}"
-                subprocess.run(cmd, shell=True, executable="/bin/bash", env=env)
-
-            logger.info("Auto-fetch complete.")
-        except Exception as e:
-            logger.error("Auto-fetch failed: %s", e)
-
-
-
     tasks = [
-        asyncio.create_task(
-            capture_loop(IFACE, pkt_queue, stop_event),
-            name="sniffer"
-        ),
-        asyncio.create_task(
-            watch_keylog(KEYLOG_PATH, key_queue, stop_event),
-            name="key-extractor"
-        ),
-        asyncio.create_task(
-            stream_to_router(pkt_queue, key_queue, stop_event),
-            name="grpc-stream"
-        ),
-        asyncio.create_task(
-            auto_fetch(),
-            name="auto-fetch"
-        )
+        asyncio.create_task(capture_loop(IFACE, pkt_queue, stop_event),         name="sniffer"),
+        asyncio.create_task(watch_keylog(KEYLOG_PATH, key_queue, stop_event),   name="key-extractor"),
+        asyncio.create_task(stream_to_router(pkt_queue, key_queue, stop_event), name="grpc-stream"),
+        asyncio.create_task(fetch_loop(pkt_queue, stop_event),                  name="fetch-loop"),
+        asyncio.create_task(heartbeat_loop(stop_event),                         name="heartbeat"),
     ]
 
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    # Wait for ALL tasks (or stop_event) — not FIRST_EXCEPTION
+    await stop_event.wait()
 
-    for t in done:
-        if t.exception():
-            logger.error("Task %s raised: %s", t.get_name(), t.exception())
-
-    stop_event.set()
-    for t in pending:
+    logger.info("[Agent] Stopping all tasks...")
+    for t in tasks:
         t.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
-
-    logger.info("Endpoint Agent stopped cleanly.")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("[Agent] Endpoint Agent stopped cleanly.")
 
 
 if __name__ == "__main__":

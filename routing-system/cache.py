@@ -25,10 +25,9 @@ class HashCache:
     def __init__(self):
         self._client: aioredis.Redis | None = None
 
-    async def connect(self):
-        self._client = aioredis.from_url(REDIS_URL, decode_responses=True)
-        await self._client.ping()
-        logger.info("Redis cache connected: %s", REDIS_URL)
+    async def connect(self, redis_client: aioredis.Redis):
+        self._client = redis_client
+        logger.info("Redis cache connected via shared client")
 
     async def lookup(self, sha256: str) -> dict | None:
         """

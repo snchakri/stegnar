@@ -120,7 +120,11 @@ services:
       MITM_GRPC_ADDR: mitm:50052
       GRPC_LISTEN_ADDR: "0.0.0.0:50051"
       RATE_LIMIT_RPS: "1000"
-      LOG_LEVEL: INFO
+      POSTGRES_DSN: "postgresql://stegnar:stegnar_secret@postgres:5432/stegnar"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS: stegnar
+      MINIO_SECRET: stegnar_minio_secret
+      LOG_LEVEL: DEBUG
       PYTHONUNBUFFERED: "1"
     ports:
       - "50051:50051"    # gRPC for endpoint agents
@@ -155,6 +159,7 @@ services:
       GRPC_LISTEN_ADDR: "0.0.0.0:50052"
       CALPA_PYTHON_PATH: /opt/tf1/bin/python3.7
       CALPA_MODEL_PATH: /calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt
+      CALPA_CFG_PATH: /calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg
       CALPA_MODEL_TYPE: srnet
       CALPA_LIBS_PATH: /calpa/libs
       CALPA_TIMEOUT_SEC: "120"
@@ -169,13 +174,13 @@ services:
     networks:
       - stegnar-net
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50052'); grpc.channel_ready_future(ch).result(timeout=5)"]
       interval: 10s
@@ -225,6 +230,9 @@ services:
       context: .
       dockerfile: stegnar-proxy/Dockerfile
     container_name: stegnar-proxy
+    depends_on:
+      routing:
+        condition: service_healthy
     privileged: true
     cap_add:
       - NET_ADMIN
@@ -268,12 +276,18 @@ services:
     depends_on:
       routing:
         condition: service_healthy
+      node-9:
+        condition: service_started
     environment:
       ENDPOINT_ID: node-1
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
-      TARGET_URL: "http://target-server/cover_test00001.jpg"
-      LOG_LEVEL: INFO
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-9:80/upload"
+      IMAGE_FILE: "/test_images/cover_test00001.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
     networks:
       - stegnar-net
     cap_add:
@@ -288,13 +302,18 @@ services:
     depends_on:
       routing:
         condition: service_healthy
+      node-10:
+        condition: service_started
     environment:
       ENDPOINT_ID: node-2
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
-      SSLKEYLOGFILE: /tmp/keys.log
-      TARGET_URL: "https://target-server/cover_test00002.jpg"
-      LOG_LEVEL: INFO
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-10:80/upload"
+      IMAGE_FILE: "/test_images/cover_test00002.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
     networks:
       - stegnar-net
     cap_add:
@@ -309,13 +328,18 @@ services:
     depends_on:
       routing:
         condition: service_healthy
+      node-11:
+        condition: service_started
     environment:
       ENDPOINT_ID: node-3
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
-      SSLKEYLOGFILE: /tmp/keys.log
-      TARGET_URL: "https://target-server/stego1_test00001.jpg"
-      LOG_LEVEL: INFO
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-11:80/upload"
+      IMAGE_FILE: "/test_images/cover_test00001.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
     networks:
       - stegnar-net
     cap_add:
@@ -330,17 +354,272 @@ services:
     depends_on:
       routing:
         condition: service_healthy
+      node-12:
+        condition: service_started
     environment:
       ENDPOINT_ID: node-4
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
-      SSLKEYLOGFILE: /tmp/keys.log
-      TARGET_URL: "https://target-server/stego2_test00002.jpg"
-      LOG_LEVEL: INFO
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-12:80/upload"
+      IMAGE_FILE: "/test_images/cover_test00002.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
     networks:
       - stegnar-net
     cap_add:
       - NET_RAW
+    restart: unless-stopped
+
+  node-5:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-5
+    depends_on:
+      routing:
+        condition: service_healthy
+      node-13:
+        condition: service_started
+    environment:
+      ENDPOINT_ID: node-5
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-13:80/upload"
+      IMAGE_FILE: "/test_images/stego1_test00001.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-6:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-6
+    depends_on:
+      routing:
+        condition: service_healthy
+      node-14:
+        condition: service_started
+    environment:
+      ENDPOINT_ID: node-6
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-14:80/upload"
+      IMAGE_FILE: "/test_images/stego1_test00001.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-7:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-7
+    depends_on:
+      routing:
+        condition: service_healthy
+      node-15:
+        condition: service_started
+    environment:
+      ENDPOINT_ID: node-7
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-15:80/upload"
+      IMAGE_FILE: "/test_images/stego2_test00002.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-8:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-8
+    depends_on:
+      routing:
+        condition: service_healthy
+      node-16:
+        condition: service_started
+    environment:
+      ENDPOINT_ID: node-8
+      ROUTER_GRPC_ADDR: routing:50051
+      CAPTURE_IFACE: eth0
+      SOC_API_URL: "http://soc-api:3001"
+      TARGET_URL: "http://node-16:80/upload"
+      IMAGE_FILE: "/test_images/stego2_test00002.jpg"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./test_images:/test_images:ro
+    networks:
+      - stegnar-net
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+
+  node-9:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-9
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-9:/received_images
+    restart: unless-stopped
+
+  node-10:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-10
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-10:/received_images
+    restart: unless-stopped
+
+  node-11:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-11
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-11:/received_images
+    restart: unless-stopped
+
+  node-12:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-12
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-12:/received_images
+    restart: unless-stopped
+
+  node-13:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-13
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-13:/received_images
+    restart: unless-stopped
+
+  node-14:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-14
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-14:/received_images
+    restart: unless-stopped
+
+  node-15:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-15
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-15:/received_images
+    restart: unless-stopped
+
+  node-16:
+    build:
+      context: .
+      dockerfile: endpoint-agent/Dockerfile
+    container_name: stegnar-node-16
+    command: ["python", "receiver.py"]
+    networks:
+      - stegnar-net
+    volumes:
+      - ./data-layer/proofs/node-16:/received_images
+    restart: unless-stopped
+
+
+  # ===========================================================================
+  # SOC API and Frontend
+  # ===========================================================================
+
+  soc-api:
+    build:
+      context: .
+      dockerfile: soc-api/Dockerfile
+    container_name: stegnar-soc-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: stegnar
+      PG_USER: stegnar
+      PG_PASS: stegnar_secret
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS: stegnar
+      MINIO_SECRET: stegnar_minio_secret
+      SOC_API_TEMP_DIR: /tmp
+    ports:
+      - "3001:3001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+
+  soc-frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    container_name: stegnar-soc-frontend
+    depends_on:
+      - soc-api
+    ports:
+      - "3000:80"
+    networks:
+      - stegnar-net
     restart: unless-stopped
 
 # ===========================================================================

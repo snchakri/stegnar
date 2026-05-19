@@ -69,7 +69,7 @@ async def serve():
     logger.info("MITM Gateway gRPC server starting on %s", LISTEN_ADDR)
     await server.start()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
     def _stop():

@@ -2,14 +2,15 @@ import { NavLink } from 'react-router';
 import {
   Database, Server, Image, Activity, Network,
   FileText, Settings as SettingsIcon, HardDrive,
-  Upload, Menu, X, Shield,
+  Upload, Menu, X, Shield, Globe, Filter,
 } from 'lucide-react';
 
 const navItems = [
   { path: '/database',    label: 'Database',    icon: Database     },
   { path: '/redis',       label: 'Redis',       icon: Server       },
   { path: '/images',      label: 'Image Feed',  icon: Image        },
-  { path: '/ingest',      label: 'Ingest',      icon: Upload       },
+  { path: '/proxy',       label: 'Proxy Logs',  icon: Globe        },
+  { path: '/ingest',      label: 'Ingest',      icon: Filter       },
   { path: '/storage',     label: 'Storage',     icon: HardDrive    },
   { path: '/performance', label: 'Performance', icon: Activity     },
   { path: '/topology',    label: 'Topology',    icon: Network      },

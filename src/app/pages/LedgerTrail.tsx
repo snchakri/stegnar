@@ -1,7 +1,8 @@
-// ─── LedgerTrail.tsx ──────────────────────────────────────────────────────────
+// ─── LedgerTrail.tsx — Replay panel removed per architecture review ────────────
 import { useState, useEffect } from 'react';
 import { TopBar } from '../components/TopBar';
-import { Shield, CheckCircle, X, Play, Loader2 } from 'lucide-react';
+import { apiUrl } from '../../lib/config';
+import { Shield, CheckCircle, X } from 'lucide-react';
 
 interface LedgerEvent {
   chain_index: number;
@@ -23,26 +24,24 @@ export function LedgerTrail() {
   const [integrity,   setIntegrity]   = useState({ verified: true, max_chain_index: 0 });
   const [typeFilter,  setTypeFilter]  = useState('All Events');
   const [selectedEvt, setSelectedEvt] = useState<LedgerEvent | null>(null);
-  const [replaying,   setReplaying]   = useState(false);
-  const [replayPct,   setReplayPct]   = useState(0);
 
-  useEffect(() => {
+  const fetchData = () => {
+    setLoading(true);
     Promise.all([
-      fetch('http://localhost:3001/api/ledger/events').then(r => r.json()),
-      fetch('http://localhost:3001/api/ledger/integrity').then(r => r.json()),
+      fetch(apiUrl('/ledger/events')).then(r => r.json()),
+      fetch(apiUrl('/ledger/integrity')).then(r => r.json()),
     ])
       .then(([evts, integ]) => { setEvents(evts); setIntegrity(integ); setLoading(false); })
       .catch(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchData();
+    const iv = setInterval(fetchData, 15_000);
+    return () => clearInterval(iv);
   }, []);
 
   const filtered = typeFilter === 'All Events' ? events : events.filter(e => e.type === typeFilter);
-
-  const handleReplay = () => {
-    setReplaying(true); setReplayPct(0);
-    const iv = setInterval(() => {
-      setReplayPct(p => { if (p >= 100) { clearInterval(iv); setReplaying(false); return 100; } return p + 5; });
-    }, 150);
-  };
 
   const inputStyle: React.CSSProperties = {
     background: 'var(--bg-card)', border: '1px solid var(--border-default)',
@@ -58,17 +57,17 @@ export function LedgerTrail() {
 
           {/* Chain integrity banner */}
           <div className="flex items-center justify-between p-4 rounded-lg border"
-            style={{ background: 'rgba(16,185,129,0.05)', borderColor: '#22c55e' }}>
+            style={{ background: integrity.verified ? 'rgba(16,185,129,0.05)' : 'rgba(239,68,68,0.05)', borderColor: integrity.verified ? '#22c55e' : '#ef4444' }}>
             <div className="flex items-center gap-3">
-              <CheckCircle className="w-5 h-5" style={{ color: '#22c55e' }} />
+              <CheckCircle className="w-5 h-5" style={{ color: integrity.verified ? '#22c55e' : '#ef4444' }} />
               <div>
                 <div style={{ fontSize: 'var(--text-sm)', fontWeight: 500, color: 'var(--text-primary)' }}>
                   {loading ? 'Checking chain…' : `Chain verified — ${integrity.max_chain_index} events recorded`}
                 </div>
-                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>All events backed by PostgreSQL + TimescaleDB</div>
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>All events backed by PostgreSQL + TimescaleDB hypertable</div>
               </div>
             </div>
-            <Shield className="w-6 h-6" style={{ color: '#22c55e' }} />
+            <Shield className="w-6 h-6" style={{ color: integrity.verified ? '#22c55e' : '#ef4444' }} />
           </div>
 
           {/* Filters */}
@@ -135,36 +134,10 @@ export function LedgerTrail() {
               </pre>
             </div>
           )}
-
-          {/* Replay panel */}
-          <div className="rounded-lg border p-4" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
-            <div style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-primary)', marginBottom: 12 }}>Replay Panel</div>
-            <div className="flex gap-3 items-end flex-wrap">
-              <button onClick={handleReplay} disabled={replaying}
-                className="flex items-center gap-2 py-2 px-4 rounded-lg"
-                style={{ background: replaying ? 'var(--bg-sidebar)' : 'var(--accent)', color: replaying ? 'var(--text-muted)' : '#fff', fontSize: 'var(--text-sm)', fontWeight: 500, cursor: replaying ? 'not-allowed' : 'pointer', border: 'none' }}>
-                {replaying ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                {replaying ? 'Replaying…' : 'Start Replay'}
-              </button>
-            </div>
-            {(replaying || replayPct === 100) && (
-              <div style={{ marginTop: 12 }}>
-                <div className="flex justify-between" style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
-                  <span>{replaying ? 'Replaying events…' : 'Replay complete'}</span>
-                  <span>{replayPct}%</span>
-                </div>
-                <div style={{ background: 'var(--bg-sidebar)', borderRadius: 4, height: 6, overflow: 'hidden' }}>
-                  <div style={{ background: replayPct===100 ? '#22c55e' : 'var(--accent)', width: `${replayPct}%`, height: '100%', transition: 'width 0.15s' }} />
-                </div>
-              </div>
-            )}
-          </div>
         </div>
       </div>
       <style>{`
         .table-row-hover:hover { background: var(--bg-hover) !important; }
-        .animate-spin { animation: spin 1s linear infinite; }
-        @keyframes spin { from{transform:rotate(0deg);}to{transform:rotate(360deg);} }
       `}</style>
     </div>
   );

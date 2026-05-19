@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { TopBar } from '../components/TopBar';
+import { apiUrl } from '../../lib/config';
 import { Database, Server, Activity, RefreshCw, Copy, Trash2 } from 'lucide-react';
 
 interface RedisKey {
@@ -39,8 +40,8 @@ export function RedisPage() {
   const fetchAll = () => {
     setLoading(true);
     Promise.all([
-      fetch('http://localhost:3001/api/redis/stats').then(r => r.json()),
-      fetch('http://localhost:3001/api/redis/keys').then(r => r.json()),
+      fetch(apiUrl('/redis/stats')).then(r => r.json()),
+      fetch(apiUrl('/redis/keys')).then(r => r.json()),
     ])
       .then(([s, k]) => { setStats(s); setKeys(k); if (k.length > 0) setSelectedKey(k[0].name); setLoading(false); })
       .catch(() => setLoading(false));

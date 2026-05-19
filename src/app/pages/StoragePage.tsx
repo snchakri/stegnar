@@ -2,7 +2,9 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router';
 import { TopBar } from '../components/TopBar';
-import { Folder, File, ChevronRight, X, ExternalLink } from 'lucide-react';
+import { apiUrl, minioUrl } from '../../lib/config';
+import { Folder, File, ChevronRight, X, ExternalLink, Download } from 'lucide-react';
+import { artifactDownloadUrl } from '../../lib/config';
 
 interface StorageFile {
   name: string;
@@ -32,7 +34,7 @@ export function StoragePage() {
   const [loading,     setLoading]     = useState(true);
 
   useEffect(() => {
-    fetch('http://localhost:3001/api/storage/buckets')
+    fetch(apiUrl('/storage/buckets'))
       .then(r => r.json())
       .then((data: Bucket[]) => {
         setBuckets(data);
@@ -136,7 +138,7 @@ export function StoragePage() {
               {selectedFile.name.match(/\.(jpg|jpeg|png|bmp)$/i) && (
                 <div className="rounded-lg border flex items-center justify-center" style={{ background: 'var(--bg-sidebar)', borderColor: 'var(--border-default)', height: 200 }}>
                   <img
-                    src={`http://localhost:9000/${selected}/${selectedFile.name}`}
+                    src={minioUrl(`${selected}/${selectedFile.name}`)}
                     alt={selectedFile.name}
                     style={{ maxHeight: '100%', maxWidth: '100%', objectFit: 'contain' }}
                     onError={e => { (e.target as HTMLImageElement).style.display='none'; }}
@@ -162,6 +164,23 @@ export function StoragePage() {
                   <span style={{ fontSize: 'var(--text-sm)' }}>View in Image Feed</span>
                 </button>
               )}
+              {/* Download button — always shown for any file */}
+              <button
+                onClick={() => {
+                  const s3Uri = `s3://${selected}/${selectedFile.name}`;
+                  const url   = artifactDownloadUrl(s3Uri);
+                  const a     = document.createElement('a');
+                  a.href      = url;
+                  a.download  = selectedFile.name;
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                }}
+                className="w-full p-3 rounded-lg border flex items-center gap-2"
+                style={{ background: 'var(--bg-sidebar)', borderColor: 'var(--border-default)', color: '#34d399', cursor: 'pointer' }}>
+                <Download className="w-4 h-4" />
+                <span style={{ fontSize: 'var(--text-sm)' }}>Download {selectedFile.name.split('.').pop()?.toUpperCase() || 'File'}</span>
+              </button>
             </div>
           </div>
         )}
