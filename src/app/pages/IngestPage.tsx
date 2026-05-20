@@ -14,6 +14,7 @@ export function IngestPage() {
 
   const [pcapFile, setPcapFile] = useState<File | null>(null);
   const [keyFile, setKeyFile] = useState<File | null>(null);
+  const [pcapPlainFile, setPcapPlainFile] = useState<File | null>(null);
 
   const pollJob = async (jobId: string) => {
     for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -96,6 +97,26 @@ export function IngestPage() {
     }
   };
 
+  const handlePcapPlainUpload = async () => {
+    if (!pcapPlainFile) return;
+    setLoading(true);
+    setError('');
+    setImgResult(null);
+    try {
+      const formData = new FormData();
+      formData.append('pcap', pcapPlainFile);
+      const data = await postForm<{ job_id?: string; status?: string }>('/ingest/pcap-plain', formData, 60000);
+      if (!data.job_id) throw new Error('No ingest job returned');
+      const finalResult = await pollJob(data.job_id);
+      setImgResult(finalResult);
+      await loadJobs();
+    } catch (e: any) {
+      setError(formatApiError(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const renderLogBlock = (title: string, text?: string) => {
     const value = (text || '').trim();
     if (!value) return null;
@@ -121,7 +142,7 @@ export function IngestPage() {
       <TopBar title="Ingest Debug & Analysis" />
       
       <div className="p-6 flex-1 overflow-auto flex flex-col items-center">
-        <div className="w-full max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="w-full max-w-6xl grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
           
           {/* Direct Image Upload Card */}
           <div className="rounded-xl border p-6 flex flex-col gap-4" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
@@ -186,6 +207,35 @@ export function IngestPage() {
                     className="w-full py-3 rounded-lg font-semibold transition-all disabled:opacity-50"
                     style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)', border: '1px solid var(--border-default)' }}>
               {loading ? 'Reconstructing & Analyzing...' : 'Extract & Analyze'}
+            </button>
+          </div>
+
+          {/* PCAP Upload (No Keys) Card */}
+          <div className="rounded-xl border p-6 flex flex-col gap-4" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
+            <div className="flex items-center gap-3 border-b pb-4" style={{ borderColor: 'var(--border-default)' }}>
+              <div className="p-2 rounded-lg" style={{ background: 'var(--bg-hover)' }}>
+                <ShieldAlert style={{ color: 'var(--accent)' }} size={24} />
+              </div>
+              <div>
+                <h3 className="font-semibold text-lg" style={{ color: 'var(--text-primary)' }}>PCAP (No Encryption)</h3>
+                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>Upload PCAP/PCAPNG with unencrypted image traffic</p>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3 flex-1">
+              <div className="border-2 border-dashed rounded-lg flex items-center justify-between p-4" style={{ borderColor: 'var(--border-default)' }}>
+                <span className="text-sm" style={{ color: 'var(--text-muted)' }}>1. Select .pcap / .pcapng</span>
+                <input type="file" id="pcap-plain-upload" className="hidden" onChange={e => setPcapPlainFile(e.target.files?.[0] || null)} />
+                <label htmlFor="pcap-plain-upload" className="cursor-pointer px-3 py-1 text-xs rounded" style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}>
+                  {pcapPlainFile ? pcapPlainFile.name : 'Browse'}
+                </label>
+              </div>
+            </div>
+
+            <button onClick={handlePcapPlainUpload} disabled={!pcapPlainFile || loading}
+                    className="w-full py-3 rounded-lg font-semibold transition-all disabled:opacity-50"
+                    style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)', border: '1px solid var(--border-default)' }}>
+              {loading ? 'Extracting & Analyzing...' : 'Extract & Analyze'}
             </button>
           </div>
         </div>

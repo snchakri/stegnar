@@ -39,7 +39,11 @@ export function LogsPage() {
       .catch(() => setLoading(false));
   };
 
-  useEffect(() => { fetchLogs(); }, [compFilter]);
+  useEffect(() => {
+    fetchLogs();
+    const iv = window.setInterval(fetchLogs, 5000);
+    return () => window.clearInterval(iv);
+  }, [compFilter, search]);
 
   const COMPONENT_COLORS: Record<string, { bg: string; text: string }> = {
     'victim-a':  { bg: '#1e3a5f', text: '#60a5fa' },

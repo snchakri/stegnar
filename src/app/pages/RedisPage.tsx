@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { TopBar } from '../components/TopBar';
-import { apiUrl } from '../../lib/config';
+import { fetchJson } from '../../lib/api';
 import { Database, Server, Activity, RefreshCw, Copy, Trash2 } from 'lucide-react';
 
 interface RedisKey {
@@ -40,14 +40,18 @@ export function RedisPage() {
   const fetchAll = () => {
     setLoading(true);
     Promise.all([
-      fetch(apiUrl('/redis/stats')).then(r => r.json()),
-      fetch(apiUrl('/redis/keys')).then(r => r.json()),
+      fetchJson('/redis/stats'),
+      fetchJson('/redis/keys'),
     ])
-      .then(([s, k]) => { setStats(s); setKeys(k); if (k.length > 0) setSelectedKey(k[0].name); setLoading(false); })
+      .then(([s, k]) => { setStats(s as RedisStats); setKeys(k as RedisKey[]); if ((k as RedisKey[]).length > 0) setSelectedKey((k as RedisKey[])[0].name); setLoading(false); })
       .catch(() => setLoading(false));
   };
 
-  useEffect(() => { fetchAll(); }, []);
+  useEffect(() => {
+    fetchAll();
+    const iv = window.setInterval(fetchAll, 5000);
+    return () => window.clearInterval(iv);
+  }, []);
 
   const selectedKeyData = keys.find(k => k.name === selectedKey);
 

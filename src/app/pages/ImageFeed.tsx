@@ -49,7 +49,11 @@ export function ImageFeed() {
       .catch(() => setLoading(false));
   };
 
-  useEffect(() => { fetchImages(); }, [classFilter]);
+  useEffect(() => {
+    fetchImages();
+    const iv = window.setInterval(fetchImages, 5000);
+    return () => window.clearInterval(iv);
+  }, [classFilter, searchQuery]);
   useEffect(() => {
     const unsubscribe = initWebSocket((img: any) => {
       setImages(prev => [img, ...prev]);

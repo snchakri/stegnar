@@ -35,8 +35,7 @@ export function DatabasePage() {
   const [search,        setSearch]          = useState('');
   const [error,         setError]          = useState('');
 
-  // Fetch table metadata (row counts)
-  useEffect(() => {
+  const fetchTableMeta = () => {
     fetchJson<any[]>('/db/tables', { timeoutMs: 10000 })
       .then((tables: any[]) => {
         const meta: Record<string, any> = {};
@@ -45,16 +44,29 @@ export function DatabasePage() {
         setError('');
       })
       .catch((e) => setError(formatApiError(e)));
+  };
+
+  const fetchRows = () => {
+    setLoading(true);
+    fetchJson<any[]>(`/db/tables/${selectedTable}/rows?limit=100`, { timeoutMs: 10000 })
+      .then(data => { setRows(data); setLoading(false); setError(''); })
+      .catch((e) => { setError(formatApiError(e)); setLoading(false); });
+  };
+
+  // Fetch table metadata (row counts)
+  useEffect(() => {
+    fetchTableMeta();
+    const iv = window.setInterval(fetchTableMeta, 5000);
+    return () => window.clearInterval(iv);
   }, []);
 
   // Fetch rows when table changes
   useEffect(() => {
-    setLoading(true);
     setPage(1);
     setSelectedRow(null);
-    fetchJson<any[]>(`/db/tables/${selectedTable}/rows?limit=100`, { timeoutMs: 10000 })
-      .then(data => { setRows(data); setLoading(false); setError(''); })
-      .catch((e) => { setError(formatApiError(e)); setLoading(false); });
+    fetchRows();
+    const iv = window.setInterval(fetchRows, 5000);
+    return () => window.clearInterval(iv);
   }, [selectedTable]);
 
   const filtered = rows.filter(r =>
@@ -141,7 +153,7 @@ export function DatabasePage() {
                 style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)', color: 'var(--text-primary)', fontSize: 'var(--text-sm)' }}
               />
             </div>
-            <button onClick={() => { setLoading(true); fetch(apiUrl(`/db/tables/${selectedTable}/rows?limit=100`)).then(r=>r.json()).then(d=>{setRows(d);setLoading(false);}).catch(()=>setLoading(false)); }}
+            <button onClick={fetchRows}
               className="p-2 rounded-lg border" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} style={{ color: 'var(--text-secondary)' }} />
             </button>

@@ -59,6 +59,7 @@ INGEST_SAMPLE_IMAGE = os.getenv("INGEST_SAMPLE_IMAGE", "/test_images/cover_test0
 CALPA_MODEL_PATH = os.getenv("CALPA_MODEL_PATH", "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt")
 CALPA_CFG_PATH = os.getenv("CALPA_CFG_PATH", "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg")
 CALPA_LIBS_PATH = os.getenv("CALPA_LIBS_PATH", "/calpa/libs")
+PCAP_PLAIN_MAX_IMAGES = int(os.getenv("PCAP_PLAIN_MAX_IMAGES", "5"))
 
 INGEST_JOBS = {}
 INGEST_LOCK = threading.Lock()
@@ -305,6 +306,63 @@ def _put_archive_bytes(client, container_id: str, target_dir: str, filename: str
         raise RuntimeError("docker put_archive failed")
 
 
+def _is_image_bytes(data: bytes) -> bool:
+    if len(data) < 4:
+        return False
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return True
+    if data.startswith(b"RIFF") and b"WEBP" in data[8:16]:
+        return True
+    if data.startswith(b"BM"):
+        return True
+    if data.startswith(b"II*\x00") or data.startswith(b"MM\x00*"):
+        return True
+    return False
+
+
+def _is_image_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+        return _is_image_bytes(head)
+    except Exception:
+        return False
+
+
+def _extract_images_from_pcap(pcap_path: str) -> tuple[str, list[str]]:
+    if shutil.which("tshark") is None:
+        raise RuntimeError("tshark not available in soc-api container")
+    extract_dir = tempfile.mkdtemp(prefix="pcap_extract_", dir=TEMP_DIR)
+    proc = subprocess.run(
+        ["tshark", "-r", pcap_path, "--export-objects", f"http,{extract_dir}"],
+        capture_output=True,
+        timeout=90,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "tshark export failed").strip())
+
+    candidates = []
+    for root, _, files in os.walk(extract_dir):
+        for name in files:
+            candidates.append(os.path.join(root, name))
+
+    images = []
+    for path in candidates:
+        suffix = pathlib.Path(path).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}:
+            images.append(path)
+            continue
+        if _is_image_file(path):
+            images.append(path)
+
+    return extract_dir, images
+
+
 def _run_calpa_for_image(local_path: str, artifact_id: str):
     suffix = pathlib.Path(local_path).suffix.lower() or ".jpg"
     payload = json.dumps({
@@ -440,6 +498,50 @@ def _start_ingest_pcap_job(pcap_path: str, key_path: str, pcap_name: str, key_na
         finally:
             pathlib.Path(pcap_path).unlink(missing_ok=True)
             pathlib.Path(key_path).unlink(missing_ok=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return job_id
+
+
+def _start_ingest_pcap_plain_job(pcap_path: str, pcap_name: str):
+    job_id = f"pcap_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    _job_set(job_id, status="queued", kind="pcap_plain", pcap=pcap_name)
+
+    def _run():
+        _job_set(job_id, status="running", started_at=int(time.time() * 1000))
+        extract_dir = None
+        try:
+            pcap_size = pathlib.Path(pcap_path).stat().st_size
+            extract_dir, images = _extract_images_from_pcap(pcap_path)
+            if not images:
+                raise RuntimeError("no images extracted from pcap")
+
+            results = []
+            for idx, img_path in enumerate(images[:max(1, PCAP_PLAIN_MAX_IMAGES)]):
+                analysis = _run_calpa_for_image(img_path, f"{pcap_name}:{idx}")
+                results.append({"image": pathlib.Path(img_path).name, **analysis})
+
+            stego_count = sum(1 for r in results if r.get("classification") == "MALICIOUS")
+            overall = "MALICIOUS" if stego_count > 0 else "BENIGN"
+            max_conf = max((r.get("confidence", 0.0) for r in results), default=0.0)
+
+            result = {
+                "classification": overall,
+                "confidence": max_conf,
+                "message": "PCAP extracted and analyzed",
+                "pcap_bytes": pcap_size,
+                "images_extracted": len(images),
+                "images_analyzed": len(results),
+                "stego_count": stego_count,
+                "results": results,
+            }
+            _job_set(job_id, status="completed", completed_at=int(time.time() * 1000), result=result)
+        except Exception as e:
+            _job_set(job_id, status="failed", completed_at=int(time.time() * 1000), error=str(e))
+        finally:
+            pathlib.Path(pcap_path).unlink(missing_ok=True)
+            if extract_dir:
+                shutil.rmtree(extract_dir, ignore_errors=True)
 
     threading.Thread(target=_run, daemon=True).start()
     return job_id
@@ -746,7 +848,7 @@ def proxy_metrics():
     interceptions = 0
     for line in logs:
         lowered = line.lower()
-        if "clientconnect" in lowered or "serverconnect" in lowered:
+        if "clientconnect" in lowered or "serverconnect" in lowered or "intercepted image" in lowered:
             interceptions += 1
 
     return jsonify({
@@ -920,6 +1022,29 @@ def ingest_pcap():
         key_path,
         pcap_file.filename or "capture.pcap",
         key_file.filename or "sslkeylog.log",
+    )
+    return jsonify({"job_id": job_id, "status": "queued"}), 202
+
+
+@app.post("/api/ingest/pcap-plain")
+def ingest_pcap_plain():
+    if "pcap" not in request.files:
+        return jsonify({"error": "pcap file required"}), 400
+
+    pcap_file = request.files["pcap"]
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    suffix = pathlib.Path(pcap_file.filename or "capture.pcap").suffix.lower() or ".pcap"
+    if suffix not in {".pcap", ".pcapng"}:
+        return jsonify({"error": "unsupported pcap format"}), 400
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=TEMP_DIR) as ptmp:
+        pcap_path = ptmp.name
+        pcap_file.save(pcap_path)
+
+    job_id = _start_ingest_pcap_plain_job(
+        pcap_path,
+        pcap_file.filename or "capture.pcap",
     )
     return jsonify({"job_id": job_id, "status": "queued"}), 202
 
