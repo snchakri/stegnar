@@ -1,0 +1,45 @@
+name: Smoke Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare runtime env file
+        run: |
+          mkdir -p runtime/ci/logs runtime/ci/soc-api-tmp runtime/ci/redis runtime/ci/postgres runtime/ci/minio runtime/ci/proxy
+          cat > .env.runtime <<'EOF'
+          RUNTIME_DIR=./runtime/ci
+          EOF
+
+      - name: Start stack
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: docker compose --env-file .env.runtime up -d --build
+
+      - name: Run ingest smoke test
+        env:
+          API_URL: http://localhost:3001
+        run: python scripts/run_ingest_test.py
+
+      - name: Show compose logs on failure
+        if: failure()
+        run: docker compose --env-file .env.runtime logs --tail=200 soc-api proxy routing data-layer mitm
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose --env-file .env.runtime down -v
