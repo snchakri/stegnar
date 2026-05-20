@@ -33,7 +33,9 @@ function layoutEndpoints(endpoints: EndpointNode[]): EndpointNode[] {
 }
 
 function computeStatus(stegoCount: number): 'healthy' | 'warning' | 'critical' {
-  return stegoCount > 0 ? 'critical' : 'healthy';
+  if (stegoCount > 3) return 'critical';
+  if (stegoCount > 0) return 'warning';
+  return 'healthy';
 }
 
 export function TopologyPage() {

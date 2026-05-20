@@ -4,6 +4,7 @@ Run: python server.py
 Port: 3001
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -60,6 +61,14 @@ CALPA_MODEL_PATH = os.getenv("CALPA_MODEL_PATH", "/calpa/generated_cfg_and_model
 CALPA_CFG_PATH = os.getenv("CALPA_CFG_PATH", "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg")
 CALPA_LIBS_PATH = os.getenv("CALPA_LIBS_PATH", "/calpa/libs")
 PCAP_PLAIN_MAX_IMAGES = int(os.getenv("PCAP_PLAIN_MAX_IMAGES", "5"))
+
+# gRPC host/port for real health-checks
+MITM_GRPC_HOST    = os.getenv("MITM_GRPC_HOST",    "mitm")
+MITM_GRPC_PORT    = int(os.getenv("MITM_GRPC_PORT",    "50052"))
+ROUTING_GRPC_HOST = os.getenv("ROUTING_GRPC_HOST", "routing")
+ROUTING_GRPC_PORT = int(os.getenv("ROUTING_GRPC_PORT", "50051"))
+# Redis stream shared with the routing system / data-layer
+REDIS_STREAM_NAME = os.getenv("REDIS_STREAM", "stegnar:db_queue")
 
 INGEST_JOBS = {}
 INGEST_LOCK = threading.Lock()
@@ -258,11 +267,132 @@ def _is_port_open(host: str, port: int, timeout_sec: float = 0.5) -> bool:
         return False
 
 
+def _write_hash_cache(sha256: str, verdict: str, steg_score: float, model_type: str = "calpa_srnet_pruned"):
+    if not sha256:
+        return
+    try:
+        conn = pg()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO hash_cache (sha256, verdict, steg_score, model_type, analyzed_at, hit_count)
+            VALUES (%s, %s, %s, %s, NOW(), 0)
+            ON CONFLICT (sha256) DO UPDATE
+            SET verdict = EXCLUDED.verdict,
+                steg_score = EXCLUDED.steg_score,
+                model_type = EXCLUDED.model_type,
+                analyzed_at = NOW()
+        """, (sha256, verdict, steg_score, model_type))
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("event=write_hash_cache_failed")
+
+
+def _write_redis_cache(sha256: str, verdict: str, steg_score: float):
+    if not sha256:
+        return
+    try:
+        r = rd()
+        key = f"stegnar:cache:{sha256}"
+        r.hset(key, mapping={
+            "verdict":    verdict,
+            "steg_score": str(steg_score),
+            "hit_count":  "0",
+        })
+        r.expire(key, 7 * 24 * 3600)
+    except Exception:
+        logger.exception("event=redis_cache_store_failed")
+
+
+
 def _job_set(job_id: str, **fields):
     with INGEST_LOCK:
         if job_id not in INGEST_JOBS:
             INGEST_JOBS[job_id] = {"job_id": job_id, "created_at": int(time.time() * 1000)}
         INGEST_JOBS[job_id].update(fields)
+
+
+def _push_event_to_redis_stream(
+    job_id: str,
+    verdict: str,
+    steg_score: float,
+    sha256: str = "",
+    filename: str = "",
+    model_type: str = "calpa_srnet_pruned",
+    latency_ms: int = 0,
+    kind: str = "ingest",
+) -> None:
+    """Push a completed ingest result onto the shared Redis stream.
+    The data-layer consumer will read this and write it to network_events."""
+    entry = {
+        "stream_id":   job_id,
+        "endpoint_id": "soc-ingest",
+        "sha256":      sha256 or "",
+        "verdict":     verdict,
+        "steg_score":  str(steg_score),
+        "src_ip":      "soc-api",
+        "dst_ip":      "soc-ingest",
+        "bytes_total": "0",
+        "latency_ms":  str(int(latency_ms)),
+        "model_type":  model_type,
+        "pcap_uri":    "",
+        "image_uri":   filename or "",
+        "ts_epoch_ms": str(int(time.time() * 1000)),
+    }
+    try:
+        r = rd()
+        r.xadd(REDIS_STREAM_NAME, entry, maxlen=10_000, approximate=True)
+        logger.info(
+            "event=redis_stream_push job_id=%s verdict=%s stream=%s",
+            job_id, verdict, REDIS_STREAM_NAME,
+        )
+    except Exception as exc:
+        logger.error(
+            "event=redis_stream_push_failed job_id=%s error=%s", job_id, exc
+        )
+
+
+def _write_audit_log(
+    actor: str,
+    event_type: str,
+    job_id: str = "",
+    endpoint_id: str = "soc-ingest",
+    sha256: str = "",
+    verdict: str = "",
+    steg_score: float = 0.0,
+    details: dict = None,
+) -> None:
+    """Append one row to system_audit_log. Best-effort: never raises."""
+    try:
+        conn = pg()
+        cur  = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO system_audit_log
+                (ts, actor, event_type, job_id, endpoint_id, sha256, verdict, steg_score, details)
+            VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                actor,
+                event_type,
+                job_id      or None,
+                endpoint_id or None,
+                sha256      or None,
+                verdict     or None,
+                float(steg_score) if steg_score else None,
+                json.dumps(details) if details else None,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        logger.debug(
+            "event=audit_log_written event_type=%s job_id=%s", event_type, job_id
+        )
+    except Exception as exc:
+        logger.error(
+            "event=audit_log_failed event_type=%s job_id=%s error=%s",
+            event_type, job_id, exc
+        )
 
 
 def _resolve_mitm_image() -> str:
@@ -333,18 +463,38 @@ def _is_image_file(path: str) -> bool:
         return False
 
 
-def _extract_images_from_pcap(pcap_path: str) -> tuple[str, list[str]]:
+def _extract_images_from_pcap(
+    pcap_path: str,
+    key_path: str = "",
+) -> tuple[str, list[str]]:
+    """Run tshark to export HTTP objects from a PCAP.
+
+    If key_path is provided, the SSL/TLS session keys are passed to tshark via
+    ``-o tls.keylog_file:<path>`` so encrypted HTTPS traffic is decrypted first.
+    Returns (extract_dir, [image_paths]).
+    """
     if shutil.which("tshark") is None:
         raise RuntimeError("tshark not available in soc-api container")
     extract_dir = tempfile.mkdtemp(prefix="pcap_extract_", dir=TEMP_DIR)
+
+    cmd = ["tshark", "-r", pcap_path]
+    if key_path and os.path.isfile(key_path):
+        cmd.extend(["-o", f"tls.keylog_file:{key_path}"])
+        logger.info("event=tshark_tls_decrypt pcap=%s key=%s", pcap_path, key_path)
+    cmd.extend(["--export-objects", f"http,{extract_dir}"])
+
     proc = subprocess.run(
-        ["tshark", "-r", pcap_path, "--export-objects", f"http,{extract_dir}"],
+        cmd,
         capture_output=True,
         timeout=90,
         text=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "tshark export failed").strip())
+        stderr_msg = (proc.stderr or proc.stdout or "tshark export failed").strip()
+        logger.warning("event=tshark_nonzero_exit pcap=%s rc=%d stderr=%s",
+                       pcap_path, proc.returncode, stderr_msg[:300])
+        # Non-zero exit is common when tshark encounters partial packets; still
+        # try to use whatever was exported rather than raising immediately.
 
     candidates = []
     for root, _, files in os.walk(extract_dir):
@@ -360,6 +510,11 @@ def _extract_images_from_pcap(pcap_path: str) -> tuple[str, list[str]]:
         if _is_image_file(path):
             images.append(path)
 
+    if not images:
+        logger.info(
+            "event=tshark_no_images pcap=%s key=%s exported=%d",
+            pcap_path, bool(key_path), len(candidates),
+        )
     return extract_dir, images
 
 
@@ -448,14 +603,17 @@ def _run_calpa_for_image(local_path: str, artifact_id: str):
     confidence = float(parsed.get("confidence", 0.0))
     latency_ms = float(parsed.get("latency_ms", 0.0))
 
-    return {
+    result = {
         "predicted_label": predicted,
         "confidence": confidence,
         "latency_ms": latency_ms,
-        "classification": "MALICIOUS" if predicted == "STEGO" else "BENIGN",
+        "classification": "STEGO" if predicted == "STEGO" else "CLEAN",
         "message": "CALPA analysis completed",
         "worker_mode": "ephemeral" if INGEST_EPHEMERAL else "exec",
+        "model_type": parsed.get("model_type", "calpa_srnet_pruned"),
     }
+    # Return raw worker output alongside result so callers can store it in the job.
+    return result, stdout, stderr
 
 
 def _start_ingest_image_job(upload_path: str, original_name: str):
@@ -464,11 +622,69 @@ def _start_ingest_image_job(upload_path: str, original_name: str):
 
     def _run():
         _job_set(job_id, status="running", started_at=int(time.time() * 1000))
+        sha256_val = ""
         try:
-            result = _run_calpa_for_image(upload_path, original_name)
-            _job_set(job_id, status="completed", completed_at=int(time.time() * 1000), result=result)
+            # Compute hash before CALPA runs (file may be deleted in finally).
+            try:
+                sha256_val = hashlib.sha256(
+                    pathlib.Path(upload_path).read_bytes()
+                ).hexdigest()
+            except Exception:
+                pass
+
+            result, w_stdout, w_stderr = _run_calpa_for_image(upload_path, original_name)
+            _job_set(
+                job_id,
+                status="completed",
+                completed_at=int(time.time() * 1000),
+                result=result,
+                worker_stdout=w_stdout,
+                worker_stderr=w_stderr,
+            )
+            # ── Persist to Redis stream → data-layer → network_events ──────────
+            _push_event_to_redis_stream(
+                job_id=job_id,
+                verdict=result.get("classification", "UNKNOWN"),
+                steg_score=result.get("confidence", 0.0),
+                sha256=sha256_val,
+                filename=original_name,
+                latency_ms=int(result.get("latency_ms", 0)),
+            )
+            # ── Write to hash_cache ───────────────────────────────────────────
+            _write_hash_cache(
+                sha256=sha256_val,
+                verdict=result.get("classification", "UNKNOWN"),
+                steg_score=result.get("confidence", 0.0),
+                model_type=result.get("model_type", "calpa_srnet_pruned"),
+            )
+            # ── Write to Redis cache ──────────────────────────────────────────
+            _write_redis_cache(
+                sha256=sha256_val,
+                verdict=result.get("classification", "UNKNOWN"),
+                steg_score=result.get("confidence", 0.0),
+            )
+            # ── Append to system_audit_log ────────────────────────────────────
+            _write_audit_log(
+                actor="soc-ingest",
+                event_type="INGEST_COMPLETE",
+                job_id=job_id,
+                sha256=sha256_val,
+                verdict=result.get("classification", "UNKNOWN"),
+                steg_score=result.get("confidence", 0.0),
+                details={
+                    "filename": original_name,
+                    "kind": "image",
+                    "worker_mode": result.get("worker_mode"),
+                },
+            )
         except Exception as e:
             _job_set(job_id, status="failed", completed_at=int(time.time() * 1000), error=str(e))
+            _write_audit_log(
+                actor="soc-ingest",
+                event_type="INGEST_FAILED",
+                job_id=job_id,
+                details={"filename": original_name, "kind": "image", "error": str(e)},
+            )
         finally:
             pathlib.Path(upload_path).unlink(missing_ok=True)
 
@@ -477,27 +693,119 @@ def _start_ingest_image_job(upload_path: str, original_name: str):
 
 
 def _start_ingest_pcap_job(pcap_path: str, key_path: str, pcap_name: str, key_name: str):
+    """Decrypt a TLS-encrypted PCAP using the provided SSL key log,
+    carve embedded images, run CALPA on each, and persist results."""
     job_id = f"pcap_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     _job_set(job_id, status="queued", kind="pcap", pcap=pcap_name, keys=key_name)
 
     def _run():
         _job_set(job_id, status="running", started_at=int(time.time() * 1000))
+        extract_dir = None
         try:
             pcap_size = pathlib.Path(pcap_path).stat().st_size
-            key_size = pathlib.Path(key_path).stat().st_size
+            # Decrypt via SSL key log and export HTTP objects
+            extract_dir, images = _extract_images_from_pcap(
+                pcap_path, key_path=key_path
+            )
+            if not images:
+                raise RuntimeError(
+                    f"no images found in PCAP after TLS decryption "
+                    f"(pcap={pcap_name} keylog={key_name}); "
+                    "verify the key log matches this capture."
+                )
+
+            per_image_results = []
+            for idx, img_path in enumerate(images[:max(1, PCAP_PLAIN_MAX_IMAGES)]):
+                img_sha256 = ""
+                try:
+                    img_sha256 = hashlib.sha256(pathlib.Path(img_path).read_bytes()).hexdigest()
+                except Exception:
+                    pass
+                analysis, w_stdout, w_stderr = _run_calpa_for_image(
+                    img_path, f"{pcap_name}:{idx}"
+                )
+                if img_sha256:
+                    _write_hash_cache(
+                        sha256=img_sha256,
+                        verdict=analysis.get("classification", "UNKNOWN"),
+                        steg_score=analysis.get("confidence", 0.0),
+                        model_type=analysis.get("model_type", "calpa_srnet_pruned"),
+                    )
+                    _write_redis_cache(
+                        sha256=img_sha256,
+                        verdict=analysis.get("classification", "UNKNOWN"),
+                        steg_score=analysis.get("confidence", 0.0),
+                    )
+                per_image_results.append({
+                    "image":          pathlib.Path(img_path).name,
+                    "sha256":         img_sha256,
+                    "worker_stdout":  w_stdout,
+                    "worker_stderr":  w_stderr,
+                    **analysis,
+                })
+
+            stego_count = sum(
+                1 for r in per_image_results if r.get("classification") == "STEGO"
+            )
+            overall    = "STEGO" if stego_count > 0 else "CLEAN"
+            max_conf   = max(
+                (r.get("confidence", 0.0) for r in per_image_results), default=0.0
+            )
+            max_lat    = max(
+                (int(r.get("latency_ms", 0)) for r in per_image_results), default=0
+            )
+
             result = {
-                "classification": "UNKNOWN",
-                "confidence": 0.0,
-                "message": "PCAP and key files accepted for forensic workflow",
-                "pcap_bytes": pcap_size,
-                "key_bytes": key_size,
+                "classification":   overall,
+                "confidence":       max_conf,
+                "latency_ms":       max_lat,
+                "message":          "PCAP decrypted and analyzed",
+                "pcap_bytes":       pcap_size,
+                "images_extracted": len(images),
+                "images_analyzed":  len(per_image_results),
+                "stego_count":      stego_count,
+                "results":          per_image_results,
             }
-            _job_set(job_id, status="completed", completed_at=int(time.time() * 1000), result=result)
+            _job_set(
+                job_id,
+                status="completed",
+                completed_at=int(time.time() * 1000),
+                result=result,
+            )
+            _push_event_to_redis_stream(
+                job_id=job_id, verdict=overall, steg_score=max_conf,
+                filename=pcap_name, latency_ms=max_lat, kind="pcap",
+            )
+            _write_audit_log(
+                actor="soc-ingest",
+                event_type="INGEST_COMPLETE",
+                job_id=job_id,
+                verdict=overall,
+                steg_score=max_conf,
+                details={
+                    "filename":        pcap_name,
+                    "kind":            "pcap",
+                    "key_file":        key_name,
+                    "images_extracted": len(images),
+                    "stego_count":     stego_count,
+                },
+            )
         except Exception as e:
-            _job_set(job_id, status="failed", completed_at=int(time.time() * 1000), error=str(e))
+            _job_set(
+                job_id, status="failed",
+                completed_at=int(time.time() * 1000), error=str(e)
+            )
+            _write_audit_log(
+                actor="soc-ingest",
+                event_type="INGEST_FAILED",
+                job_id=job_id,
+                details={"filename": pcap_name, "kind": "pcap", "error": str(e)},
+            )
         finally:
             pathlib.Path(pcap_path).unlink(missing_ok=True)
             pathlib.Path(key_path).unlink(missing_ok=True)
+            if extract_dir:
+                shutil.rmtree(extract_dir, ignore_errors=True)
 
     threading.Thread(target=_run, daemon=True).start()
     return job_id
@@ -511,33 +819,97 @@ def _start_ingest_pcap_plain_job(pcap_path: str, pcap_name: str):
         _job_set(job_id, status="running", started_at=int(time.time() * 1000))
         extract_dir = None
         try:
-            pcap_size = pathlib.Path(pcap_path).stat().st_size
-            extract_dir, images = _extract_images_from_pcap(pcap_path)
+            pcap_size   = pathlib.Path(pcap_path).stat().st_size
+            extract_dir, images = _extract_images_from_pcap(pcap_path)  # no key → plain HTTP
             if not images:
                 raise RuntimeError("no images extracted from pcap")
 
-            results = []
+            per_image_results = []
             for idx, img_path in enumerate(images[:max(1, PCAP_PLAIN_MAX_IMAGES)]):
-                analysis = _run_calpa_for_image(img_path, f"{pcap_name}:{idx}")
-                results.append({"image": pathlib.Path(img_path).name, **analysis})
+                img_sha256 = ""
+                try:
+                    img_sha256 = hashlib.sha256(pathlib.Path(img_path).read_bytes()).hexdigest()
+                except Exception:
+                    pass
+                analysis, w_stdout, w_stderr = _run_calpa_for_image(
+                    img_path, f"{pcap_name}:{idx}"
+                )
+                if img_sha256:
+                    _write_hash_cache(
+                        sha256=img_sha256,
+                        verdict=analysis.get("classification", "UNKNOWN"),
+                        steg_score=analysis.get("confidence", 0.0),
+                        model_type=analysis.get("model_type", "calpa_srnet_pruned"),
+                    )
+                    _write_redis_cache(
+                        sha256=img_sha256,
+                        verdict=analysis.get("classification", "UNKNOWN"),
+                        steg_score=analysis.get("confidence", 0.0),
+                    )
+                per_image_results.append({
+                    "image":         pathlib.Path(img_path).name,
+                    "sha256":        img_sha256,
+                    "worker_stdout": w_stdout,
+                    "worker_stderr": w_stderr,
+                    **analysis,
+                })
 
-            stego_count = sum(1 for r in results if r.get("classification") == "MALICIOUS")
-            overall = "MALICIOUS" if stego_count > 0 else "BENIGN"
-            max_conf = max((r.get("confidence", 0.0) for r in results), default=0.0)
+            stego_count = sum(
+                1 for r in per_image_results if r.get("classification") == "STEGO"
+            )
+            overall  = "STEGO" if stego_count > 0 else "CLEAN"
+            max_conf = max(
+                (r.get("confidence", 0.0) for r in per_image_results), default=0.0
+            )
+            max_lat  = max(
+                (int(r.get("latency_ms", 0)) for r in per_image_results), default=0
+            )
 
             result = {
-                "classification": overall,
-                "confidence": max_conf,
-                "message": "PCAP extracted and analyzed",
-                "pcap_bytes": pcap_size,
+                "classification":   overall,
+                "confidence":       max_conf,
+                "latency_ms":       max_lat,
+                "message":          "PCAP extracted and analyzed",
+                "pcap_bytes":       pcap_size,
                 "images_extracted": len(images),
-                "images_analyzed": len(results),
-                "stego_count": stego_count,
-                "results": results,
+                "images_analyzed":  len(per_image_results),
+                "stego_count":      stego_count,
+                "results":          per_image_results,
             }
-            _job_set(job_id, status="completed", completed_at=int(time.time() * 1000), result=result)
+            _job_set(
+                job_id,
+                status="completed",
+                completed_at=int(time.time() * 1000),
+                result=result,
+            )
+            _push_event_to_redis_stream(
+                job_id=job_id, verdict=overall, steg_score=max_conf,
+                filename=pcap_name, latency_ms=max_lat, kind="pcap_plain",
+            )
+            _write_audit_log(
+                actor="soc-ingest",
+                event_type="INGEST_COMPLETE",
+                job_id=job_id,
+                verdict=overall,
+                steg_score=max_conf,
+                details={
+                    "filename":         pcap_name,
+                    "kind":             "pcap_plain",
+                    "images_extracted": len(images),
+                    "stego_count":      stego_count,
+                },
+            )
         except Exception as e:
-            _job_set(job_id, status="failed", completed_at=int(time.time() * 1000), error=str(e))
+            _job_set(
+                job_id, status="failed",
+                completed_at=int(time.time() * 1000), error=str(e)
+            )
+            _write_audit_log(
+                actor="soc-ingest",
+                event_type="INGEST_FAILED",
+                job_id=job_id,
+                details={"filename": pcap_name, "kind": "pcap_plain", "error": str(e)},
+            )
         finally:
             pathlib.Path(pcap_path).unlink(missing_ok=True)
             if extract_dir:
@@ -554,9 +926,13 @@ def health():
     services.append({"name":"PostgreSQL","status":"online" if _is_port_open(PG_HOST, PG_PORT) else "offline","port":PG_PORT})
     services.append({"name":"Redis","status":"online" if _is_port_open(REDIS_HOST, REDIS_PORT) else "offline","port":REDIS_PORT})
     services.append({"name":"MinIO","status":"online" if _is_port_open(minio_host, int(minio_port)) else "offline","port":int(minio_port)})
-    services.append({"name":"MITM Gateway","status":"online","port":50052})
-    services.append({"name":"Routing System","status":"online","port":50051})
-    services.append({"name":"CALPA Model","status":"online","port":0})
+    # Real TCP probe — previously these were hardcoded as always-online.
+    mitm_ok    = _is_port_open(MITM_GRPC_HOST,    MITM_GRPC_PORT,    timeout_sec=1.5)
+    routing_ok = _is_port_open(ROUTING_GRPC_HOST, ROUTING_GRPC_PORT, timeout_sec=1.5)
+    services.append({"name":"MITM Gateway",   "status":"online" if mitm_ok    else "offline", "port":MITM_GRPC_PORT})
+    services.append({"name":"Routing System", "status":"online" if routing_ok else "offline", "port":ROUTING_GRPC_PORT})
+    # CALPA runs inside the MITM container — report healthy iff MITM is reachable.
+    services.append({"name":"CALPA Model",    "status":"online" if mitm_ok    else "offline", "port":0})
     return jsonify({"services": services})
 
 
@@ -582,14 +958,48 @@ def admin_diagnostics():
 @app.get("/api/db/tables")
 def db_tables():
     try:
-        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT t.tablename AS name, COALESCE(s.n_live_tup,0) AS row_count,
-                   COALESCE(s.last_autoanalyze,NOW())::text AS last_write
-            FROM pg_tables t LEFT JOIN pg_stat_user_tables s ON s.relname=t.tablename
-            WHERE t.schemaname='public' ORDER BY row_count DESC""")
-        rows = cur.fetchall(); conn.close()
-        return jsonify([dict(r) for r in rows])
+        conn = pg()
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT tablename AS name FROM pg_tables WHERE schemaname='public'")
+        tables = [r["name"] for r in cur.fetchall()]
+        result = []
+        for name in tables:
+            try:
+                cur.execute(f"SELECT COUNT(*) AS row_cnt FROM {name}")
+                cnt = cur.fetchone()["row_cnt"]
+            except Exception:
+                cnt = 0
+            # Try to get the latest update timestamp from the table if it has 'ts' or 'analyzed_at' or 'last_activity'
+            last_write = "2000-01-01 00:00:00"
+            try:
+                if name == "network_events":
+                    cur.execute("SELECT MAX(ts) AS max_val FROM network_events")
+                    res = cur.fetchone()["max_val"]
+                    if res: last_write = str(res)
+                elif name == "hash_cache":
+                    cur.execute("SELECT MAX(analyzed_at) AS max_val FROM hash_cache")
+                    res = cur.fetchone()["max_val"]
+                    if res: last_write = str(res)
+                elif name == "endpoint_registry":
+                    cur.execute("SELECT MAX(last_activity) AS max_val FROM endpoint_registry")
+                    res = cur.fetchone()["max_val"]
+                    if res: last_write = str(res)
+                elif name == "system_audit_log":
+                    cur.execute("SELECT MAX(ts) AS max_val FROM system_audit_log")
+                    res = cur.fetchone()["max_val"]
+                    if res: last_write = str(res)
+            except Exception:
+                pass
+            result.append({
+                "name": name,
+                "row_count": cnt,
+                "last_write": last_write
+            })
+        conn.close()
+        # Sort tables by row count descending
+        result.sort(key=lambda x: x["row_count"], reverse=True)
+        return jsonify(result)
     except Exception:
         logger.exception("event=db_tables_failed")
         return jsonify({"error": "database unavailable"}), 500
@@ -597,12 +1007,22 @@ def db_tables():
 
 @app.get("/api/db/tables/<table_name>/rows")
 def db_rows(table_name):
-    if table_name not in ["network_events","hash_cache","endpoint_registry"]:
+    if table_name not in ["network_events","hash_cache","endpoint_registry","system_audit_log"]:
         return jsonify({"error":"not allowed"}), 403
     limit = min(int(request.args.get("limit",100)), 500)
     try:
         conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(f"SELECT * FROM {table_name} ORDER BY 1 DESC LIMIT %s", (limit,))
+        # Determine the best column to order by for chronological correctness
+        order_col = "1"
+        if table_name == "network_events":
+            order_col = "ts"
+        elif table_name == "system_audit_log":
+            order_col = "ts"
+        elif table_name == "hash_cache":
+            order_col = "analyzed_at"
+        elif table_name == "endpoint_registry":
+            order_col = "last_activity"
+        cur.execute(f"SELECT * FROM {table_name} ORDER BY {order_col} DESC LIMIT %s", (limit,))
         rows = cur.fetchall()
     except Exception:
         logger.exception("event=db_rows_failed table=%s", table_name)
@@ -677,12 +1097,20 @@ def images():
     except Exception:
         logger.exception("event=images_failed")
         rows = []
-    v_map = {"STEGO":"malicious","CLEAN":"benign","AMBIGUOUS":"suspicious"}; result = []
+    v_map = {
+        "STEGO": "malicious",
+        "MALICIOUS": "malicious",
+        "CLEAN": "benign",
+        "BENIGN": "benign",
+        "AMBIGUOUS": "suspicious",
+        "SUSPICIOUS": "suspicious"
+    }
+    result = []
     for r in rows:
         row = dict(r)
         for k,v in row.items():
             if hasattr(v,"isoformat"): row[k] = v.isoformat()
-        row["classification"] = v_map.get(row.get("classification",""),"benign")
+        row["classification"] = v_map.get(str(row.get("classification","")).upper(),"benign")
         result.append(row)
     return jsonify(result)
 
@@ -775,6 +1203,41 @@ def ledger_events():
         return jsonify([dict(r) for r in rows])
     except Exception:
         logger.exception("event=ledger_events_failed")
+        return jsonify([])
+
+
+@app.get("/api/audit/events")
+def audit_events():
+    """Return recent entries from system_audit_log (SOC ingest / operator events)."""
+    limit = min(int(request.args.get("limit", 200)), 500)
+    try:
+        conn = pg()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT audit_id::text, ts::text AS timestamp, actor, event_type,
+                   job_id, endpoint_id, sha256, verdict, steg_score, details
+            FROM system_audit_log
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            row = dict(r)
+            # details comes back as dict from psycopg2 when column is JSONB
+            if isinstance(row.get("details"), str):
+                try:
+                    row["details"] = json.loads(row["details"])
+                except Exception:
+                    pass
+            result.append(row)
+        return jsonify(result)
+    except Exception:
+        logger.exception("event=audit_events_failed")
         return jsonify([])
 
 
@@ -1096,9 +1559,21 @@ def ws_events(ws):
                     row = dict(r)
                     for k,v in row.items():
                         if hasattr(v,"isoformat"): row[k] = v.isoformat()
-                    row["classification"] = {"STEGO":"malicious","CLEAN":"benign","AMBIGUOUS":"suspicious"}.get(row.get("classification",""),"benign")
+                    row["classification"] = {
+                        "STEGO": "malicious",
+                        "MALICIOUS": "malicious",
+                        "CLEAN": "benign",
+                        "BENIGN": "benign",
+                        "AMBIGUOUS": "suspicious",
+                        "SUSPICIOUS": "suspicious"
+                    }.get(str(row.get("classification","")).upper(), "benign")
                     last_ts = row["first_seen_ts"]
-                    ws.send(json.dumps({"type":"new_image","payload":row}))
+                    try:
+                        ws.send(json.dumps({"type":"new_image","payload":row}))
+                    except Exception:
+                        # Client disconnected — exit cleanly instead of leaking a thread.
+                        logger.info("event=ws_events_client_disconnected")
+                        return
             conn.close()
         except psycopg2.OperationalError as exc:
             logger.warning("event=ws_events_db_unavailable error=%s", exc)
@@ -1108,8 +1583,8 @@ def ws_events(ws):
             except Exception:
                 pass
             time.sleep(5)
-        except Exception:
-            logger.exception("event=ws_events_failed")
+        except Exception as exc:
+            logger.exception("event=ws_events_failed error=%s", exc)
             try:
                 if conn:
                     conn.close()

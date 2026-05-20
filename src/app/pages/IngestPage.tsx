@@ -6,7 +6,9 @@ import { FileUp, ShieldAlert, Cpu, Copy, RefreshCw } from 'lucide-react';
 export function IngestPage() {
   const [imgFile, setImgFile] = useState<File | null>(null);
   const [imgResult, setImgResult] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
+  const [imageLoading,    setImageLoading]    = useState(false);
+  const [pcapLoading,     setPcapLoading]     = useState(false);
+  const [pcapPlainLoading,setPcapPlainLoading]= useState(false);
   const [error, setError] = useState('');
   const [jobs, setJobs] = useState<any[]>([]);
   const [jobsError, setJobsError] = useState('');
@@ -15,6 +17,8 @@ export function IngestPage() {
   const [pcapFile, setPcapFile] = useState<File | null>(null);
   const [keyFile, setKeyFile] = useState<File | null>(null);
   const [pcapPlainFile, setPcapPlainFile] = useState<File | null>(null);
+
+  const anyLoading = imageLoading || pcapLoading || pcapPlainLoading;
 
   const pollJob = async (jobId: string) => {
     for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -58,7 +62,7 @@ export function IngestPage() {
 
   const handleImageUpload = async () => {
     if (!imgFile) return;
-    setLoading(true);
+    setImageLoading(true);
     setError('');
     setImgResult(null);
     try {
@@ -72,13 +76,13 @@ export function IngestPage() {
     } catch (e: any) {
       setError(formatApiError(e));
     } finally {
-      setLoading(false);
+      setImageLoading(false);
     }
   };
 
   const handlePcapUpload = async () => {
     if (!pcapFile || !keyFile) return;
-    setLoading(true);
+    setPcapLoading(true);
     setError('');
     setImgResult(null);
     try {
@@ -93,13 +97,13 @@ export function IngestPage() {
     } catch (e: any) {
       setError(formatApiError(e));
     } finally {
-      setLoading(false);
+      setPcapLoading(false);
     }
   };
 
   const handlePcapPlainUpload = async () => {
     if (!pcapPlainFile) return;
-    setLoading(true);
+    setPcapPlainLoading(true);
     setError('');
     setImgResult(null);
     try {
@@ -113,7 +117,7 @@ export function IngestPage() {
     } catch (e: any) {
       setError(formatApiError(e));
     } finally {
-      setLoading(false);
+      setPcapPlainLoading(false);
     }
   };
 
@@ -166,10 +170,10 @@ export function IngestPage() {
               </label>
             </div>
 
-            <button onClick={handleImageUpload} disabled={!imgFile || loading}
+            <button onClick={handleImageUpload} disabled={!imgFile || imageLoading || anyLoading}
                     className="w-full py-3 rounded-lg font-semibold transition-all disabled:opacity-50"
                     style={{ background: 'var(--accent)', color: '#fff' }}>
-              {loading ? 'Analyzing via CALPA-NET...' : 'Run Analysis'}
+              {imageLoading ? 'Analyzing via CALPA-NET...' : 'Run Analysis'}
             </button>
           </div>
 
@@ -203,10 +207,10 @@ export function IngestPage() {
               </div>
             </div>
 
-            <button onClick={handlePcapUpload} disabled={!pcapFile || !keyFile || loading}
+            <button onClick={handlePcapUpload} disabled={!pcapFile || !keyFile || pcapLoading || anyLoading}
                     className="w-full py-3 rounded-lg font-semibold transition-all disabled:opacity-50"
                     style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)', border: '1px solid var(--border-default)' }}>
-              {loading ? 'Reconstructing & Analyzing...' : 'Extract & Analyze'}
+              {pcapLoading ? 'Reconstructing & Analyzing...' : 'Extract & Analyze'}
             </button>
           </div>
 
@@ -232,10 +236,10 @@ export function IngestPage() {
               </div>
             </div>
 
-            <button onClick={handlePcapPlainUpload} disabled={!pcapPlainFile || loading}
+            <button onClick={handlePcapPlainUpload} disabled={!pcapPlainFile || pcapPlainLoading || anyLoading}
                     className="w-full py-3 rounded-lg font-semibold transition-all disabled:opacity-50"
                     style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)', border: '1px solid var(--border-default)' }}>
-              {loading ? 'Extracting & Analyzing...' : 'Extract & Analyze'}
+              {pcapPlainLoading ? 'Extracting & Analyzing...' : 'Extract & Analyze'}
             </button>
           </div>
         </div>
@@ -259,7 +263,13 @@ export function IngestPage() {
             <div className="flex justify-center gap-12">
               <div className="text-center">
                 <div className="text-sm uppercase tracking-wider mb-2" style={{ color: 'var(--text-muted)' }}>Classification</div>
-                <div className={`text-2xl font-bold px-4 py-1 rounded-full ${imgResult.classification?.toUpperCase() === 'MALICIOUS' ? 'bg-red-900/30 text-red-400' : 'bg-green-900/30 text-green-400'}`}>
+                <div className={`text-2xl font-bold px-4 py-1 rounded-full ${
+                  ['STEGO', 'MALICIOUS'].includes(imgResult.classification?.toUpperCase())
+                    ? 'bg-red-900/30 text-red-400'
+                    : ['AMBIGUOUS', 'SUSPICIOUS'].includes(imgResult.classification?.toUpperCase())
+                      ? 'bg-yellow-900/30 text-yellow-400'
+                      : 'bg-green-900/30 text-green-400'
+                }`}>
                   {imgResult.classification?.toUpperCase() || 'UNKNOWN'}
                 </div>
               </div>

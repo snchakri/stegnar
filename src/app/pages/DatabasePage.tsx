@@ -8,9 +8,10 @@ const REAL_TABLES = [
   { name: 'network_events',     description: 'All forensic detections' },
   { name: 'hash_cache',         description: 'SHA-256 analysis cache'  },
   { name: 'endpoint_registry',  description: 'Enrolled endpoint agents'},
+  { name: 'system_audit_log',   description: 'Operator and system audit trails'},
 ];
 
-type TableName = 'network_events' | 'hash_cache' | 'endpoint_registry';
+type TableName = 'network_events' | 'hash_cache' | 'endpoint_registry' | 'system_audit_log';
 
 function timeAgo(ts: string) {
   const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
@@ -20,9 +21,10 @@ function timeAgo(ts: string) {
 }
 
 function verdictColor(v: string) {
-  if (v === 'STEGO')     return { bg: 'rgba(239,68,68,0.1)',  text: '#f87171' };
-  if (v === 'AMBIGUOUS') return { bg: 'rgba(245,158,11,0.1)', text: '#fbbf24' };
-  return                        { bg: 'rgba(16,185,129,0.1)', text: '#34d399' };
+  const upper = String(v).toUpperCase();
+  if (upper === 'STEGO' || upper === 'MALICIOUS')     return { bg: 'rgba(239,68,68,0.1)',  text: '#f87171' };
+  if (upper === 'AMBIGUOUS' || upper === 'SUSPICIOUS') return { bg: 'rgba(245,158,11,0.1)', text: '#fbbf24' };
+  return                                               { bg: 'rgba(16,185,129,0.1)', text: '#34d399' };
 }
 
 export function DatabasePage() {

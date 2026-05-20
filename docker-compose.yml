@@ -640,11 +640,22 @@ services:
       MINIO_ACCESS: stegnar
       MINIO_SECRET: stegnar_minio_secret
       SOC_API_TEMP_DIR: /tmp/stegnar-soc
-      # Use exec into the existing MITM container instead of creating ephemeral containers.
-      # Ephemeral container creation may fail due to Compose network name prefixes
-      # (e.g. stegnar_prototype_stegnar-net). Use exec mode for more reliable runs.
+      # Ingest pipeline wiring — explicit to avoid relying on Python defaults.
+      INGEST_MITM_CONTAINER: "stegnar-mitm"
       INGEST_EPHEMERAL: "false"
       INGEST_TIMEOUT_SEC: "300"
+      INGEST_NETWORK: "stegnar-net"
+      # CALPA paths inside the MITM container that calpa_worker.py reads.
+      CALPA_MODEL_PATH: "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt"
+      CALPA_CFG_PATH:   "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg"
+      CALPA_LIBS_PATH:  "/calpa/libs"
+      # gRPC addresses for real health-checks.
+      MITM_GRPC_HOST:    "mitm"
+      MITM_GRPC_PORT:    "50052"
+      ROUTING_GRPC_HOST: "routing"
+      ROUTING_GRPC_PORT: "50051"
+      # Redis stream name — must match data-layer consumer.
+      REDIS_STREAM: "stegnar:db_queue"
     ports:
       - "3001:3001"
     volumes:

@@ -67,6 +67,29 @@ CREATE TABLE IF NOT EXISTS endpoint_registry (
 );
 
 -- =============================================================================
+-- system_audit_log — append-only SOC operator / ingest event audit trail
+-- =============================================================================
+-- Plain Postgres table (not a hypertable) — forensic audit events do not need
+-- the time-partitioning of sensor data; they benefit from simple sequential inserts.
+CREATE TABLE IF NOT EXISTS system_audit_log (
+    audit_id     UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor        TEXT        NOT NULL,           -- "soc-ingest", "routing", "operator"
+    event_type   TEXT        NOT NULL,           -- "INGEST_COMPLETE", "INGEST_FAILED", "CLASSIFICATION", etc.
+    job_id       TEXT,                           -- ingest job ID if applicable
+    endpoint_id  TEXT,                           -- endpoint / stream source
+    sha256       TEXT,                           -- payload hash
+    verdict      TEXT,                           -- CLEAN | STEGO | AMBIGUOUS | UNKNOWN
+    steg_score   FLOAT,
+    details      JSONB                           -- arbitrary structured detail (filename, error, model, etc.)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sal_ts          ON system_audit_log (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_sal_event_type  ON system_audit_log (event_type, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_sal_job_id      ON system_audit_log (job_id)  WHERE job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sal_endpoint_id ON system_audit_log (endpoint_id) WHERE endpoint_id IS NOT NULL;
+
+-- =============================================================================
 -- Continuous aggregate: per-minute verdict summary for SOC dashboard
 -- =============================================================================
 CREATE MATERIALIZED VIEW IF NOT EXISTS verdict_per_minute

@@ -23,6 +23,7 @@ import json
 import math
 import os
 import sys
+import time
 
 # ── Python 2/3 configparser compatibility ────────────────────────────────────
 try:
@@ -260,13 +261,17 @@ def main():
     try:
         if 'cfg_path' not in req:
             raise ValueError("Invalid schema: 'cfg_path' missing. (Wrong worker script?)")
-        
+
         image_path = req['image_path']
         model_path = req['model_path']
         cfg_path   = req['cfg_path']
 
+        t0     = time.time()
         result = run_inference(image_path, model_path, cfg_path)
-        result['model_type'] = 'calpa_srnet_pruned'
+        t1     = time.time()
+
+        result['latency_ms']  = int((t1 - t0) * 1000)
+        result['model_type']  = 'calpa_srnet_pruned'
         result['artifact_id'] = req.get('artifact_id', '')
         print(json.dumps(result))
 
