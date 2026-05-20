@@ -1,3 +1,29 @@
+"""
+====================================================================================================
+  stegnar-proxy · addon.py — Mitmproxy Interception Hook & Payload Carving Engine
+====================================================================================================
+
+  THE INLINE NETWORK INTRUSION PROBE:
+  -----------------------------------
+  This script runs inside `stegnar-proxy` (Mitmproxy instance). Its main objective is to intercept and
+  carve uncompressed image binaries passing through both HTTP requests (uploads) and HTTP responses
+  (downloads). 
+
+  It operates completely transparently to the target client and endpoint.
+
+  INTERCEPTION MECHANICS:
+  -----------------------
+  1. Requests & Responses: Listens to raw traffic streams via `request()` and `response()` hooks.
+  2. Magic Byte Sniffing: If the Content-Type header or the raw binary prefix matches known image magic
+     signatures (JPEG, PNG, WebP, BMP, GIF), it proceeds to parse the payload.
+  3. Stream Identification: Constructs a unique `stream_id` hash based on TCP connections
+     (Client IP:Port -> Server IP:Port) to preserve conversational context.
+  4. Non-Blocking Async gRPC Queue: Assembles a protobuf `PayloadChunk` object and pushes it onto an internal
+     asyncio queue. A background coroutine (`stream_worker()`) continuously streams these chunks to the
+     central `routing` system via a persistent HTTP/2 gRPC channel with connection auto-recovery.
+====================================================================================================
+"""
+
 import mitmproxy.http
 import hashlib
 import time

@@ -1,10 +1,28 @@
 """
-main.py — Data Layer entry point.
+====================================================================================================
+  stegnar-data · main.py — Continuous Ingestion Daemon & Persistent Ledger Writer
+====================================================================================================
 
-Runs an asyncio loop that reads from the Redis Stream consumer group
-and writes events into PostgreSQL. (MinIO uploads of raw PCAP/Image bytes
-would happen here too if the bytes were attached, but for vTBP we are writing
-URIs directly from the MITM/Routing layer or ignoring PCAP for now).
+  THE ASYNCHRONOUS DATA LEDGER:
+  ----------------------------
+  The Data Layer operates as a stateless backend queue worker. Its core mandate is to ingest parsed
+  threat data and forensic metadata from the hot Redis Streams queue and commit it reliably to Postgres
+  (TimescaleDB) and object storage.
+  
+  This decoupling acts as a vital "shock absorber", preventing incoming network packet streams from being
+  dropped or backed up during spikes in analysis volumes or during database locks.
+
+  QUEUING MECHANICS & CONSUMER GROUPS:
+  ------------------------------------
+  - Redis Stream Name: `stegnar:db_queue` (configurable via `REDIS_STREAM`)
+  - Consumer Group Name: `data_layer_cg`
+  - Client Worker Name: `worker_1` (each worker instance gets a unique ID in a swarm setup)
+
+  Upon startup, the script verifies or dynamically creates the Redis Consumer Group at ID '0' (beginning of
+  stream). It then enters a non-blocking asyncio read group loop, bulk-processing batches of up to 50
+  threat records per tick, writing them to relational hypertables, and executing explicit ACKs to purge completed
+  records from the message stream.
+====================================================================================================
 """
 
 import asyncio

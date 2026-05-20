@@ -1,17 +1,36 @@
 """
-servicer.py — gRPC RouterService implementation.
+====================================================================================================
+  stegnar-routing · servicer.py — gRPC RouterService Orchestration Engine
+====================================================================================================
 
-Handles the StreamPayload RPC from Endpoint Agents.
+  THE PILLARS OF ORCHESTRATION:
+  ----------------------------
+  The `RouterServicer` operates as the high-throughput asynchronous core of the entire Stegnar platform.
+  It acts as the traffic cop and central arbiter between edge sensors (Endpoint Agents), privileged
+  MITM Decryption nodes, and the cold storage database layer.
 
-For each incoming PayloadChunk:
-  1. Rate-limit check → drop if exceeded
-  2. Redis cache lookup by SHA-256
-     → HIT:  write CACHE_HIT event to queue, skip MITM dispatch
-     → MISS: detect if payload contains an image (MIME sniff)
-       → IMAGE:    dispatch to MITM gateway → write result to cache + queue
-       → NO_IMAGE: write NO_IMAGE event to queue (minimal metadata)
+  THE PIPELINE PIPELINE PROCESS:
+  ----------------------------
+  For each connection and stream payload initiated by edge sensors, the servicer executes a highly
+  structured, multi-stage processing pipeline:
 
-This is the central decision engine of the vTBP system.
+    1. Rate Limiting (Token Bucket): Immediately queries the `RateLimiter` to check if the endpoint has
+       exceeded requests. Dropped chunks protect the system from accidental DoS.
+    2. Stream Reassembly & Tracking: Accumulates raw incoming bytes, dynamically mapping incoming keys to
+       active TLS payloads.
+    3. Forensic PCAP Generation: Background PyShark/Tshark reassembles TLS keys and raw capture bytes
+       into fully compliant, decryption-ready `.pcap` files for deep forensic audits.
+    4. Hash Deduplication Bypass (Sub-Millisecond Cache): Compares the SHA-256 hash of payloads against
+       a hot Redis `HashCache`. If matched (verdict cached), it commands the endpoint agent to abort
+       transmission (`skip_check`), bypassing ML analysis entirely to save compute cycles.
+    5. Sniffing & Payload Extraction: Inspects raw data or carved output via magic bytes to detect image type files.
+    6. MITM Probe Dispatch: Non-blocking gRPC dispatch to isolated stateless `calpa-probe` nodes.
+    7. Persistence: Streams the completed score, forensic `.pcap` URI, and metadata to Redis Stream
+       for decoupled time-series writing (TimescaleDB / Postgres).
+
+  This decoupled design ensures maximum fault isolation: ML probes can go offline without dropping a
+  single byte of incoming traffic.
+====================================================================================================
 """
 
 import asyncio

@@ -37,6 +37,7 @@ export function PerformancePage() {
   const [stegCount,    setStegCount]    = useState<number | null>(null);
   const [avgLatency,   setAvgLatency]   = useState<number | null>(null);
   const [buckets,      setBuckets]      = useState<MetricBucket[]>([]);
+  const [lastUpdated,  setLastUpdated]  = useState<Date | null>(null);
 
   const fetchHealth = () => {
     fetch(apiUrl('/health'))
@@ -52,6 +53,7 @@ export function PerformancePage() {
       .then(data => {
         setAvgLatency(data.avg_latency_ms);
         setBuckets(data.buckets || []);
+        setLastUpdated(new Date());
       })
       .catch(() => {});
 
@@ -69,7 +71,7 @@ export function PerformancePage() {
     fetchHealth();
     fetchMetrics();
     const healthIv   = setInterval(fetchHealth,   10_000);
-    const metricsIv  = setInterval(fetchMetrics,  30_000);
+    const metricsIv  = setInterval(fetchMetrics,  10_000);
     return () => { clearInterval(healthIv); clearInterval(metricsIv); };
   }, []);
 
@@ -139,9 +141,16 @@ export function PerformancePage() {
           {/* Activity chart — real data */}
           <div className="rounded-lg border" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
             <div className="p-4 border-b" style={{ borderColor: 'var(--border-default)' }}>
-              <h2 style={{ fontSize: 'var(--text-lg)', fontWeight: 600, color: 'var(--text-primary)' }}>Images Analyzed Over Time</h2>
+              <div className="flex items-center justify-between">
+                <h2 style={{ fontSize: 'var(--text-lg)', fontWeight: 600, color: 'var(--text-primary)' }}>Images Analyzed Over Time</h2>
+                {lastUpdated && (
+                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+                    Updated {lastUpdated.toLocaleTimeString()}
+                  </span>
+                )}
+              </div>
               <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)', marginTop: 4 }}>
-                Last 15 minutes (live from PostgreSQL TimescaleDB)
+                Last 15 minutes · live from PostgreSQL TimescaleDB · refreshes every 10s
               </p>
             </div>
             <div className="p-6">

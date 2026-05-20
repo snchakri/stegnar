@@ -1,7 +1,33 @@
 """
-soc-api/server.py
-Run: python server.py
-Port: 3001
+====================================================================================================
+  stegnar-soc-api · server.py — Central Operations API & Management Portal
+====================================================================================================
+
+  THE BRAIN OF VISIBILITY & TELEMETRY:
+  ------------------------------------
+  The SOC API serves as the administrative core and data orchestrator for security analysts. It is a
+  highly concurrent Flask web server running alongside a Flask-Sock WebSocket daemon that pipes real-time
+  events from PostgreSQL directly to the browser.
+
+  CORE MODULE RESPONSIBILITIES:
+  ----------------------------
+  The server exposes REST APIs and real-time streams to facilitate three distinct operational pillars:
+
+    1. Telemetry Aggregation: Real-time queries over TimescaleDB hypertables, displaying processed images,
+       detection rates, latency metrics, and raw logs (from both `stegnar-proxy` and `stegnar-mitm`).
+    2. Dynamic Infrastructure Control: Orchestrates hot container actions, using Docker SDK or local CLI
+       wrappers to spin up, configure, and inspect privileged network bridge subnets.
+    3. Forensic Ingestion Portal: Enables security operators to manually upload suspect images or raw PCAPs,
+       submitting them out-of-band to the same asynchronous CALPA-NET pipeline used in passive mode.
+    4. Real-time Live Event Streaming (WebSockets): Continuous tailing of the TimescaleDB ledger, pushing
+       new classifications (CLEAN, STEGO, SUSPICIOUS) to active analyst screens under 2 seconds.
+
+  DEVELOPMENT NOTE FOR OPEN SOURCE CONTRIBUTORS:
+  ----------------------------------------------
+  Database connections are established dynamically utilizing a psycopg2 thread pool. When modifying
+  endpoints, always ensure connections are cleanly closed inside `finally` blocks to avoid connection
+  exhaustion under high load.
+====================================================================================================
 """
 
 import hashlib
@@ -56,7 +82,7 @@ INGEST_EPHEMERAL = os.getenv("INGEST_EPHEMERAL", "true").strip().lower() in ("1"
 INGEST_MITM_CONTAINER = os.getenv("INGEST_MITM_CONTAINER", "stegnar-mitm")
 INGEST_MITM_IMAGE = os.getenv("INGEST_MITM_IMAGE", "")
 INGEST_NETWORK = os.getenv("INGEST_NETWORK", "").strip()
-INGEST_SAMPLE_IMAGE = os.getenv("INGEST_SAMPLE_IMAGE", "/test_images/cover_test00001.jpg")
+INGEST_SAMPLE_IMAGE = os.getenv("INGEST_SAMPLE_IMAGE", "")
 CALPA_MODEL_PATH = os.getenv("CALPA_MODEL_PATH", "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt")
 CALPA_CFG_PATH = os.getenv("CALPA_CFG_PATH", "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg")
 CALPA_LIBS_PATH = os.getenv("CALPA_LIBS_PATH", "/calpa/libs")
@@ -1319,6 +1345,88 @@ def proxy_metrics():
         "intercepted_connections": interceptions,
         "total_log_lines": len(logs),
         "uptime_status": "Running" if is_running else "Offline",
+    })
+
+
+@app.get("/api/mitm/logs")
+def mitm_logs():
+    """Return recent logs from the stegnar-mitm container."""
+    container = _docker_get_container("stegnar-mitm")
+    if container is None:
+        return jsonify([])
+    try:
+        raw = container.logs(tail=200).decode("utf-8", errors="replace")
+        lines = [line for line in raw.splitlines() if line.strip()]
+        return jsonify(lines[-200:])
+    except Exception:
+        logger.exception("event=mitm_logs_failed")
+        return jsonify([])
+
+
+@app.get("/api/mitm/metrics")
+def mitm_metrics():
+    """Return MITM container status + real telemetry from Postgres network_events."""
+    is_running = False
+    log_lines  = 0
+    container  = _docker_get_container("stegnar-mitm")
+    if container is not None:
+        try:
+            container.reload()
+            is_running = container.status == "running"
+        except Exception:
+            logger.exception("event=mitm_metrics_status_failed")
+        try:
+            raw = container.logs(tail=500).decode("utf-8", errors="replace")
+            log_lines = len([l for l in raw.splitlines() if l.strip()])
+        except Exception:
+            logger.exception("event=mitm_metrics_logs_failed")
+
+    # Pull real telemetry from Postgres for last 1 hour
+    images_intercepted = 0
+    stego_detected     = 0
+    clean_count        = 0
+    ambiguous_count    = 0
+    avg_latency_ms     = 0.0
+    try:
+        conn = pg()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                COUNT(*)                                           AS total,
+                COUNT(*) FILTER (WHERE verdict = 'STEGO')         AS stego,
+                COUNT(*) FILTER (WHERE verdict = 'CLEAN')         AS clean,
+                COUNT(*) FILTER (WHERE verdict = 'AMBIGUOUS')     AS ambiguous,
+                COALESCE(AVG(latency_ms) FILTER (
+                    WHERE latency_ms IS NOT NULL AND latency_ms > 0
+                ), 0)                                              AS avg_lat
+            FROM network_events
+            WHERE ts >= NOW() - INTERVAL '1 hour'
+        """)
+        row = cur.fetchone()
+        if row:
+            images_intercepted = int(row[0] or 0)
+            stego_detected     = int(row[1] or 0)
+            clean_count        = int(row[2] or 0)
+            ambiguous_count    = int(row[3] or 0)
+            avg_latency_ms     = float(row[4] or 0.0)
+        conn.close()
+    except Exception:
+        logger.exception("event=mitm_metrics_db_failed")
+
+    detection_rate = 0.0
+    if images_intercepted > 0:
+        detection_rate = round((stego_detected / images_intercepted) * 100, 1)
+
+    return jsonify({
+        "status":              "active" if is_running else "offline",
+        "container_status":    "Running" if is_running else "Offline",
+        "total_log_lines":     log_lines,
+        "images_intercepted":  images_intercepted,
+        "stego_detected":      stego_detected,
+        "clean_count":         clean_count,
+        "ambiguous_count":     ambiguous_count,
+        "avg_latency_ms":      round(avg_latency_ms, 1),
+        "detection_rate":      detection_rate,
     })
 
 

@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router';
 import { initWebSocket } from '../../lib/websocket';
 import { apiUrl, minioUrl } from '../../lib/config';
 import { TopBar } from '../components/TopBar';
-import { Search, RefreshCw, X, FileText, Network } from 'lucide-react';
+import { Search, RefreshCw, X, FileText, Network, Download } from 'lucide-react';
 
 interface ImageRecord {
   id: string;
@@ -22,9 +22,10 @@ interface ImageRecord {
 }
 
 function classColor(cls: string) {
-  if (cls === 'malicious')  return { bg: 'rgba(239,68,68,0.1)',  text: '#f87171' };
-  if (cls === 'suspicious') return { bg: 'rgba(245,158,11,0.1)', text: '#fbbf24' };
-  return                           { bg: 'rgba(16,185,129,0.1)', text: '#34d399' };
+  const upper = String(cls).toUpperCase();
+  if (upper === 'STEGO' || upper === 'MALICIOUS')      return { bg: 'rgba(239,68,68,0.1)',  text: '#f87171' };
+  if (upper === 'AMBIGUOUS' || upper === 'SUSPICIOUS') return { bg: 'rgba(245,158,11,0.1)', text: '#fbbf24' };
+  return                                               { bg: 'rgba(16,185,129,0.1)', text: '#34d399' };
 }
 
 export function ImageFeed() {
@@ -222,7 +223,45 @@ export function ImageFeed() {
                 </div>
               </div>
 
-              {/* Action buttons */}
+              {/* Download buttons */}
+              <div className="space-y-2">
+                {selected.minio_img_uri && (
+                  <button
+                    onClick={() => {
+                      const url = minioUrl(selected.minio_img_uri!);
+                      const a   = document.createElement('a');
+                      a.href     = url;
+                      a.download = `${selected.sha256_hash?.slice(0, 12) ?? 'image'}.jpg`;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                    }}
+                    className="w-full p-3 rounded-lg border flex items-center gap-2"
+                    style={{ background: 'var(--bg-sidebar)', borderColor: 'rgba(52,211,153,0.35)', color: '#34d399', cursor: 'pointer' }}>
+                    <Download className="w-4 h-4" />
+                    <span style={{ fontSize: 'var(--text-sm)' }}>Download Image</span>
+                  </button>
+                )}
+                {selected.minio_pcap_uri && (
+                  <button
+                    onClick={() => {
+                      const url = minioUrl(selected.minio_pcap_uri!);
+                      const a   = document.createElement('a');
+                      a.href     = url;
+                      a.download = `${selected.sha256_hash?.slice(0, 12) ?? 'capture'}.pcap`;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                    }}
+                    className="w-full p-3 rounded-lg border flex items-center gap-2"
+                    style={{ background: 'var(--bg-sidebar)', borderColor: 'rgba(96,165,250,0.35)', color: '#60a5fa', cursor: 'pointer' }}>
+                    <Download className="w-4 h-4" />
+                    <span style={{ fontSize: 'var(--text-sm)' }}>Download PCAP</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Navigation buttons */}
               <div className="space-y-2">
                 <button onClick={() => navigate(`/logs?component=${selected.endpoint_id || ''}`)}
                   className="w-full p-3 rounded-lg border flex items-center gap-2"

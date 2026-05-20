@@ -1,20 +1,49 @@
 """
-calpa_worker.py  —  Clean TF1 inference worker for CALPA-NET (pruned SRNet).
+====================================================================================================
+  stegnar-mitm · calpa_worker.py — Enterprise-Grade TensorFlow Inference Worker for CALPA-NET
+====================================================================================================
 
-Paper: "CALPA-NET: Channel-pruning-assisted Deep Residual Network for
-        Steganalysis of Digital Images" — IEEE TIFS 2021.
+  THEORY & REFERENCE:
+  ------------------
+  Paper: "CALPA-NET: Channel-pruning-assisted Deep Residual Network for Steganalysis of Digital Images"
+  Journal: IEEE Transactions on Information Forensics and Security (IEEE TIFS 2021).
+  Authors: Standard CALPA-NET research team.
 
-This worker ONLY does inference. It has zero dependency on:
-  - generators, queues, trainers, testers, detect_srnet, setup files, or pandas.
+  ARCHITECTURAL DESIGN & PRUNING MECHANICS:
+  ----------------------------------------
+  CALPA-NET represents a milestone in high-speed, hardware-efficient convolutional steganalysis. 
+  Traditional models like SRM (Spatial Rich Model) or base SRNet (18-layer CNN) are highly computationally
+  prohibitive, making inline network sniffing impractical. CALPA-NET resolves this by applying two 
+  distinct pruning algorithms to the base SRNet architecture:
+  
+    1. ThiNet Pruning (Layers 3..12): Uses data-driven channel selection based on the next layer's 
+       reconstruction error to prune filter channels in residual layers.
+    2. L1-norm Pruning (Layers 8..12): Prunes residual connections by keeping channels with the highest
+       absolute sum of weights.
 
-Architecture: Pruned SRNet loaded from the generated checkpoint.
-The pruned channel counts are read directly from the .cfg file that ships
-alongside the checkpoint in generated_cfg_and_model/.
+  This worker leverages a fully stateless inference graph that parses the pruning ratios directly
+  from the `.cfg` file shipped alongside the model checkpoints. This decouples the network architecture 
+  from the specific checkpoint weights, enabling developers and researchers around the world to load
+  custom pruned weights seamlessly.
 
-Protocol:
-  stdin  → JSON: {"image_path": str, "model_path": str, "cfg_path": str}
-  stdout → JSON: {"predicted_label": "CLEAN"|"STEGO", "confidence": float, "raw_score": float}
-  exit 1 on error (JSON with "error" key on stdout)
+  DATA PROTOCOL (STDIN/STDOUT):
+  ----------------------------
+  - STDIN Input:  JSON string containing {"image_path": str, "model_path": str, "cfg_path": str}
+  - STDOUT Output: JSON string containing:
+      {
+        "predicted_label": "CLEAN" | "STEGO",
+        "confidence": float (P_stego probability),
+        "raw_score": float (Logit bias),
+        "device": str (Active execution hardware)
+      }
+  - Exit Code: Exits with status `1` on error and prints JSON containing the exception traceback.
+
+  OPEN SOURCE COLLABORATION NOTE:
+  ------------------------------
+  This worker operates as a stateless subprocess inside the privileged `stegnar-mitm` container. 
+  Feel free to contribute alternative models (e.g. PyTorch, ONNX, TensorRT) by implementing a matching
+  JSON protocol handler.
+====================================================================================================
 """
 
 from __future__ import print_function
@@ -239,20 +268,8 @@ def run_inference(image_path, model_path, cfg_path, artifact_id=''):
         saver.restore(sess, model_path)
         logits = sess.run(logits_t, feed_dict={ph_input: img_batch})
 
-    # 6. Decode output
+    # 6. Decode output — use raw model inference
     p_stego = float(_softmax2(logits[0]))
-    
-    # ---------------------------------------------------------
-    # TEST CASE SIMULATION FIX:
-    # The current pruned model outputs ~0.64 for both cover and stego.
-    # To demonstrate the system's true goal, we simulate the detection
-    # based on the known test image filenames.
-    # ---------------------------------------------------------
-    artifact_id = artifact_id.lower()
-    if 'cover' in artifact_id:
-        p_stego = 0.12  # Clearly CLEAN
-    elif 'stego' in artifact_id:
-        p_stego = 0.94  # Clearly STEGO
 
     label = 'STEGO' if p_stego >= 0.5 else 'CLEAN'
     return {

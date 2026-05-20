@@ -1,9 +1,59 @@
+# ==========================================
+# Stegnar Open Source GitIgnore Configurations
+# ==========================================
+
+# Core Application/Runtime Data
 node_modules/
 dist/
+build/
+out/
+runtime/
+test_images/
+temp_data/
+*.log
+*.pcap
+*.key
+
+# Environments & Secret Configurations
 .env
 .env.local
 .env.runtime
-runtime/
+.env.*.local
+
+# Python Build & Caching
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+.pytest_cache/
+doc/_build/
+
+# Packaging
 pnpm-lock.yaml
+package-lock.json
+yarn.lock
+*.egg-info/
+.eggs/
+
+# IDE & Editor specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+.DS_Store
+Thumbs.db
