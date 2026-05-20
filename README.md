@@ -1,4 +1,4 @@
-# Stegnar: A Distributed Platform for Real-Time and Forensic Steganalysis
+# Stegnar: Distributed Platform for Real-Time and Forensic Steganalysis against APTs
 
 ## 1. Abstract
 
@@ -8,7 +8,7 @@ By decoupling network interception, payload ingestion, and computationally expen
 
 ---
 
-## 2. Thesis: The Problem of At-Scale Steganalysis
+## 2. The Problem of At-Scale Steganalysis
 
 **Core Problem:** The detection of modern steganography is computationally intensive. The Convolutional Neural Networks (CNNs) required for high-accuracy analysis, such as SRNet, demand significant GPU resources. Performing this analysis in-line on a live network link is infeasible, as it would introduce unacceptable latency and immediately alert adversaries to the presence of deep packet inspection. Furthermore, the sheer volume of benign media traffic (images, videos) in a typical enterprise network would overwhelm any monolithic analysis engine.
 
@@ -66,7 +66,7 @@ ate_limiter.py**: Protects the inference cluster from being overwhelmed by traff
 
 ---
 
-## 5. Data Flow: A Walkthrough
+## 5. Data Flow
 
 To understand how the components work together, let's trace the lifecycle of a single image file containing steganographic data.
 
@@ -180,7 +180,7 @@ This will update stegnar_pb2.py and stegnar_pb2_grpc.py, which must then be copi
 
 ## 10. Contributing
 
-We welcome contributions from the community. Please see our detailed CONTRIBUTING.md file in the docs/ directory for guidelines on pull requests, code style, and our development process.
+We welcome contributions from the community. Please see our detailed ``CONTRIBUTING.md file`` in the docs/ directory for guidelines on pull requests, code style, and our development process.
 
 ## 11. License
 
