@@ -81,53 +81,54 @@ async def heartbeat_loop(stop_event: asyncio.Event):
 
 async def fetch_loop(pkt_queue: asyncio.Queue, stop_event: asyncio.Event):
     """
-    Perform a single POST upload of IMAGE_FILE to TARGET_URL.
+    Perform periodic POST uploads of random images to TARGET_URL.
     """
-    IMAGE_FILE = os.environ.get("IMAGE_FILE", "")
-    if not TARGET_URL or not IMAGE_FILE:
-        logger.info("[fetch_loop] No TARGET_URL or IMAGE_FILE set — idle.")
+    if not TARGET_URL:
+        logger.info("[fetch_loop] No TARGET_URL set — idle.")
         await stop_event.wait()
         return
 
-    marker_path = pathlib.Path(SEND_ONCE_MARKER)
-    if marker_path.exists():
-        logger.info("[fetch_loop] Send-once marker exists (%s). Skipping upload.", marker_path)
-        await stop_event.wait()
-        return
-
-    logger.info("[fetch_loop] Starting single upload — file=%s target=%s", IMAGE_FILE, TARGET_URL)
+    logger.info("[fetch_loop] Starting periodic uploads to target=%s every %ds", TARGET_URL, FETCH_INTERVAL)
 
     # Initial warm-up delay so routing comes fully online
     await asyncio.sleep(12)
 
-    try:
-        env = os.environ.copy()
-        env["SSLKEYLOGFILE"] = KEYLOG_PATH
+    import glob
+    import random
+    test_images = glob.glob("/test_images/*.jpg")
+    
+    while not stop_event.is_set():
+        if not test_images:
+            logger.warning("[fetch_loop] No images found in /test_images/. Waiting.")
+            await asyncio.sleep(FETCH_INTERVAL)
+            continue
+            
+        img_to_send = random.choice(test_images)
+        logger.info("[fetch_loop] Uploading %s...", img_to_send)
 
-        proc = subprocess.run(
-            ["curl", "-s", "-S", "-k", "-X", "POST", "-H", "Content-Type: image/jpeg", "--data-binary", f"@{IMAGE_FILE}", TARGET_URL],
-            env=env, capture_output=True, timeout=15,
-        )
-        logger.info(
-            "[fetch_loop] Upload completed. rc=%d stdout=%s stderr=%s",
-            proc.returncode, proc.stdout.decode()[:100], proc.stderr.decode(errors="ignore")[:200],
-        )
+        try:
+            env = os.environ.copy()
+            env["SSLKEYLOGFILE"] = KEYLOG_PATH
 
-        if proc.returncode == 0:
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(str(int(_time.time())), encoding="utf-8")
-            logger.info("[fetch_loop] Send-once marker written: %s", marker_path)
-        else:
-            logger.warning("[fetch_loop] Upload failed, marker not written (rc=%d)", proc.returncode)
+            proc = subprocess.run(
+                ["curl", "-s", "-S", "-k", "-X", "POST", "-H", "Content-Type: image/jpeg", "--data-binary", f"@{img_to_send}", TARGET_URL],
+                env=env, capture_output=True, timeout=15,
+            )
+            
+            if proc.returncode == 0:
+                logger.info("[fetch_loop] Upload completed successfully.")
+            else:
+                logger.warning("[fetch_loop] Upload failed (rc=%d)", proc.returncode)
 
-    except subprocess.TimeoutExpired:
-        logger.error("[fetch_loop] Upload TIMED OUT for %s", TARGET_URL)
-    except Exception as e:
-        logger.error("[fetch_loop] Upload error: %s", e, exc_info=True)
+        except subprocess.TimeoutExpired:
+            logger.error("[fetch_loop] Upload TIMED OUT for %s", TARGET_URL)
+        except Exception as e:
+            logger.error("[fetch_loop] Upload error: %s", e, exc_info=True)
 
-    # After single upload, just wait forever so sniffer and gRPC stay alive
-    logger.info("[fetch_loop] Upload finished. Waiting for shutdown.")
-    await stop_event.wait()
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=FETCH_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def main():

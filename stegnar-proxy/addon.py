@@ -37,37 +37,45 @@ class StegnarAddon:
                 print(f"[StegnarAddon] gRPC stream error: {e}")
                 await asyncio.sleep(5)
 
+    def request(self, flow: mitmproxy.http.HTTPFlow):
+        if flow.request and flow.request.content:
+            content_type = flow.request.headers.get("Content-Type", "")
+            if "image/" in content_type.lower() or _sniff_image(flow.request.content):
+                self._process_image(flow, flow.request.content)
+
     def response(self, flow: mitmproxy.http.HTTPFlow):
         if flow.response and flow.response.content:
             content_type = flow.response.headers.get("Content-Type", "")
             if "image/" in content_type.lower() or _sniff_image(flow.response.content):
-                img_bytes = flow.response.content
-                if len(img_bytes) > 1000:
-                    sha = hashlib.sha256(img_bytes).hexdigest()
-                    
-                    # Create payload chunk
-                    client_ip = flow.client_conn.peername[0] if flow.client_conn and flow.client_conn.peername else "0.0.0.0"
-                    client_port = flow.client_conn.peername[1] if flow.client_conn and flow.client_conn.peername else 0
-                    server_ip = flow.server_conn.peername[0] if flow.server_conn and flow.server_conn.peername else "0.0.0.0"
-                    server_port = flow.server_conn.peername[1] if flow.server_conn and flow.server_conn.peername else 443
-                    
-                    stream_id = f"{client_ip}:{client_port}-{server_ip}:{server_port}"
-                    
-                    chunk = pb.PayloadChunk(
-                        endpoint_id=f"proxy-{client_ip}",
-                        stream_id=stream_id,
-                        raw_bytes=img_bytes,
-                        sha256=sha,
-                        ssl_keylog="", # Not needed, payload is plaintext!
-                        src_ip=client_ip,
-                        dst_ip=server_ip,
-                        src_port=client_port,
-                        dst_port=server_port,
-                        captured_at=int(time.time() * 1000),
-                    )
-                    
-                    self.queue.put_nowait(chunk)
-                    print(f"[StegnarAddon] Intercepted image from {server_ip}, sending to router...")
+                self._process_image(flow, flow.response.content)
+
+    def _process_image(self, flow, img_bytes):
+        if len(img_bytes) > 1000:
+            sha = hashlib.sha256(img_bytes).hexdigest()
+            
+            # Create payload chunk
+            client_ip = flow.client_conn.peername[0] if flow.client_conn and flow.client_conn.peername else "0.0.0.0"
+            client_port = flow.client_conn.peername[1] if flow.client_conn and flow.client_conn.peername else 0
+            server_ip = flow.server_conn.peername[0] if flow.server_conn and flow.server_conn.peername else "0.0.0.0"
+            server_port = flow.server_conn.peername[1] if flow.server_conn and flow.server_conn.peername else 443
+            
+            stream_id = f"{client_ip}:{client_port}-{server_ip}:{server_port}"
+            
+            chunk = pb.PayloadChunk(
+                endpoint_id=f"proxy-{client_ip}",
+                stream_id=stream_id,
+                raw_bytes=img_bytes,
+                sha256=sha,
+                ssl_keylog="", # Not needed, payload is plaintext!
+                src_ip=client_ip,
+                dst_ip=server_ip,
+                src_port=client_port,
+                dst_port=server_port,
+                captured_at=int(time.time() * 1000),
+            )
+            
+            self.queue.put_nowait(chunk)
+            print(f"[StegnarAddon] Intercepted image, sending to router...")
 
 def _sniff_image(raw_bytes: bytes) -> bool:
     _IMAGE_MAGIC = {
