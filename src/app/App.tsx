@@ -12,6 +12,7 @@ import { LogsPage } from './pages/LogsPage';
 import { LedgerTrail } from './pages/LedgerTrail';
 import { SettingsPage } from './pages/SettingsPage';
 import { ProxyPage } from './pages/ProxyPage';
+import { DiagnosticsPage } from './pages/DiagnosticsPage';
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -36,6 +37,7 @@ export default function App() {
               <Route path="/logs"        element={<LogsPage />} />
               <Route path="/ledger"      element={<LedgerTrail />} />
               <Route path="/settings"    element={<SettingsPage />} />
+              <Route path="/diagnostics" element={<DiagnosticsPage />} />
             </Routes>
           </main>
         </div>

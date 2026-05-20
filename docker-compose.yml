@@ -9,7 +9,7 @@ services:
     container_name: stegnar-redis
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
-      - redis_data:/data
+      - ${RUNTIME_DIR:-./runtime/current}/redis:/data
     ports:
       - "6379:6379"
     networks:
@@ -29,7 +29,7 @@ services:
       POSTGRES_PASSWORD: stegnar_secret
       POSTGRES_DB: stegnar
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - ${RUNTIME_DIR:-./runtime/current}/postgres:/var/lib/postgresql/data
       - ./data-layer/migrations:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
@@ -50,7 +50,7 @@ services:
       MINIO_ROOT_USER: stegnar
       MINIO_ROOT_PASSWORD: stegnar_minio_secret
     volumes:
-      - minio_data:/data
+      - ${RUNTIME_DIR:-./runtime/current}/minio:/data
     ports:
       - "9000:9000"    # S3 API
       - "9001:9001"    # MinIO console
@@ -114,7 +114,7 @@ services:
       redis:
         condition: service_healthy
       mitm:
-        condition: service_started
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379
       MITM_GRPC_ADDR: mitm:50052
@@ -211,8 +211,8 @@ services:
       REDIS_STREAM: stegnar:db_queue
       POSTGRES_DSN: "postgresql://stegnar:stegnar_secret@postgres:5432/stegnar"
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: stegnar
-      MINIO_SECRET_KEY: stegnar_minio_secret
+      MINIO_ACCESS: stegnar
+      MINIO_SECRET: stegnar_minio_secret
       MINIO_BUCKET_ARTIFACTS: stegnar-artifacts
       MINIO_BUCKET_PCAPS: stegnar-pcaps
       LOG_LEVEL: INFO
@@ -220,6 +220,11 @@ services:
     networks:
       - stegnar-net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('redis',6379),2); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
 
   # ===========================================================================
   # Transparent MITM Proxy (Mode C)
@@ -242,10 +247,16 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - proxy_data:/app/.mitmproxy
+      - ${RUNTIME_DIR:-./runtime/current}/proxy:/app/.mitmproxy
+      - ${RUNTIME_DIR:-./runtime/current}/logs:/var/log/stegnar
     networks:
       - stegnar-net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f mitmdump >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
 
   # ===========================================================================
   # Installer Server
@@ -259,7 +270,7 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - proxy_data:/app/certs:ro
+      - ${RUNTIME_DIR:-./runtime/current}/proxy:/app/certs:ro
     networks:
       - stegnar-net
     restart: unless-stopped
@@ -282,12 +293,15 @@ services:
       ENDPOINT_ID: node-1
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-9:80/upload"
-      IMAGE_FILE: "/test_images/cover_test00001.jpg"
+      TARGET_URL: ${SENDER_1_TARGET_URL:-http://node-9:80/upload}
+      IMAGE_FILE: ${SENDER_1_IMAGE_FILE:-/test_images/cover_test00001.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-1:/state
     networks:
       - stegnar-net
     cap_add:
@@ -308,12 +322,15 @@ services:
       ENDPOINT_ID: node-2
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-10:80/upload"
-      IMAGE_FILE: "/test_images/cover_test00002.jpg"
+      TARGET_URL: ${SENDER_2_TARGET_URL:-http://node-10:80/upload}
+      IMAGE_FILE: ${SENDER_2_IMAGE_FILE:-/test_images/cover_test00002.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-2:/state
     networks:
       - stegnar-net
     cap_add:
@@ -334,12 +351,15 @@ services:
       ENDPOINT_ID: node-3
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-11:80/upload"
-      IMAGE_FILE: "/test_images/cover_test00001.jpg"
+      TARGET_URL: ${SENDER_3_TARGET_URL:-http://node-11:80/upload}
+      IMAGE_FILE: ${SENDER_3_IMAGE_FILE:-/test_images/cover_test00001.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-3:/state
     networks:
       - stegnar-net
     cap_add:
@@ -360,12 +380,15 @@ services:
       ENDPOINT_ID: node-4
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-12:80/upload"
-      IMAGE_FILE: "/test_images/cover_test00002.jpg"
+      TARGET_URL: ${SENDER_4_TARGET_URL:-http://node-12:80/upload}
+      IMAGE_FILE: ${SENDER_4_IMAGE_FILE:-/test_images/cover_test00002.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-4:/state
     networks:
       - stegnar-net
     cap_add:
@@ -386,12 +409,15 @@ services:
       ENDPOINT_ID: node-5
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-13:80/upload"
-      IMAGE_FILE: "/test_images/stego1_test00001.jpg"
+      TARGET_URL: ${SENDER_5_TARGET_URL:-http://node-13:80/upload}
+      IMAGE_FILE: ${SENDER_5_IMAGE_FILE:-/test_images/stego1_test00001.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-5:/state
     networks:
       - stegnar-net
     cap_add:
@@ -412,12 +438,15 @@ services:
       ENDPOINT_ID: node-6
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-14:80/upload"
-      IMAGE_FILE: "/test_images/stego1_test00001.jpg"
+      TARGET_URL: ${SENDER_6_TARGET_URL:-http://node-14:80/upload}
+      IMAGE_FILE: ${SENDER_6_IMAGE_FILE:-/test_images/stego1_test00001.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-6:/state
     networks:
       - stegnar-net
     cap_add:
@@ -438,12 +467,15 @@ services:
       ENDPOINT_ID: node-7
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-15:80/upload"
-      IMAGE_FILE: "/test_images/stego2_test00002.jpg"
+      TARGET_URL: ${SENDER_7_TARGET_URL:-http://node-15:80/upload}
+      IMAGE_FILE: ${SENDER_7_IMAGE_FILE:-/test_images/stego2_test00002.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-7:/state
     networks:
       - stegnar-net
     cap_add:
@@ -464,12 +496,15 @@ services:
       ENDPOINT_ID: node-8
       ROUTER_GRPC_ADDR: routing:50051
       CAPTURE_IFACE: eth0
+      CAPTURE_FILTER: ${SENDER_CAPTURE_FILTER:-tcp and dst port 80}
       SOC_API_URL: "http://soc-api:3001"
-      TARGET_URL: "http://node-16:80/upload"
-      IMAGE_FILE: "/test_images/stego2_test00002.jpg"
+      TARGET_URL: ${SENDER_8_TARGET_URL:-http://node-16:80/upload}
+      IMAGE_FILE: ${SENDER_8_IMAGE_FILE:-/test_images/cover_test00001.jpg}
+      SEND_ONCE_MARKER: /state/send_once.done
       LOG_LEVEL: DEBUG
     volumes:
       - ./test_images:/test_images:ro
+      - ${RUNTIME_DIR:-./runtime/current}/sender-state/node-8:/state
     networks:
       - stegnar-net
     cap_add:
@@ -485,7 +520,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-9:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-9:/received_images
     restart: unless-stopped
 
   node-10:
@@ -497,7 +532,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-10:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-10:/received_images
     restart: unless-stopped
 
   node-11:
@@ -509,7 +544,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-11:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-11:/received_images
     restart: unless-stopped
 
   node-12:
@@ -521,7 +556,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-12:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-12:/received_images
     restart: unless-stopped
 
   node-13:
@@ -533,7 +568,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-13:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-13:/received_images
     restart: unless-stopped
 
   node-14:
@@ -545,7 +580,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-14:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-14:/received_images
     restart: unless-stopped
 
   node-15:
@@ -557,7 +592,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-15:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-15:/received_images
     restart: unless-stopped
 
   node-16:
@@ -569,7 +604,7 @@ services:
     networks:
       - stegnar-net
     volumes:
-      - ./data-layer/proofs/node-16:/received_images
+      - ${RUNTIME_DIR:-./runtime/current}/proofs/node-16:/received_images
     restart: unless-stopped
 
 
@@ -589,6 +624,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      routing:
+        condition: service_healthy
+      mitm:
+        condition: service_healthy
     environment:
       PG_HOST: postgres
       PG_PORT: 5432
@@ -600,14 +639,26 @@ services:
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS: stegnar
       MINIO_SECRET: stegnar_minio_secret
-      SOC_API_TEMP_DIR: /tmp
+      SOC_API_TEMP_DIR: /tmp/stegnar-soc
+      # Use exec into the existing MITM container instead of creating ephemeral containers.
+      # Ephemeral container creation may fail due to Compose network name prefixes
+      # (e.g. stegnar_prototype_stegnar-net). Use exec mode for more reliable runs.
+      INGEST_EPHEMERAL: "false"
+      INGEST_TIMEOUT_SEC: "300"
     ports:
       - "3001:3001"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${RUNTIME_DIR:-./runtime/current}/logs:/var/log/stegnar
+      - ${RUNTIME_DIR:-./runtime/current}/soc-api-tmp:/tmp/stegnar-soc
     networks:
       - stegnar-net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 
   soc-frontend:
     build:
@@ -615,7 +666,8 @@ services:
       dockerfile: frontend.Dockerfile
     container_name: stegnar-soc-frontend
     depends_on:
-      - soc-api
+      soc-api:
+        condition: service_healthy
     ports:
       - "3000:80"
     networks:
@@ -632,9 +684,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/24
-
-volumes:
-  redis_data:
-  pg_data:
-  minio_data:
-  proxy_data:

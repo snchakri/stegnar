@@ -4,10 +4,19 @@ import { WS_URL } from './config'
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+const listeners = new Set<(img: any) => void>()
 
-export function initWebSocket(onNewImage: (img: any) => void) {
-  // Clear any existing reconnect timer
-  if (reconnectTimer) clearTimeout(reconnectTimer)
+function scheduleReconnect() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+  }
+  reconnectTimer = setTimeout(() => connect(), 3000)
+}
+
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return
+  }
 
   try {
     ws = new WebSocket(WS_URL)
@@ -20,7 +29,7 @@ export function initWebSocket(onNewImage: (img: any) => void) {
       try {
         const msg = JSON.parse(e.data)
         if (msg.type === 'new_image') {
-          onNewImage(msg.payload)
+          listeners.forEach((listener) => listener(msg.payload))
         }
       } catch {
         // ignore malformed messages
@@ -28,19 +37,38 @@ export function initWebSocket(onNewImage: (img: any) => void) {
     }
 
     ws.onclose = () => {
-      console.log('[WS] Disconnected — reconnecting in 3s')
-      reconnectTimer = setTimeout(() => initWebSocket(onNewImage), 3000)
+      ws = null
+      if (listeners.size > 0) {
+        console.log('[WS] Disconnected — reconnecting in 3s')
+        scheduleReconnect()
+      }
     }
 
     ws.onerror = () => {
       ws?.close()
     }
   } catch {
-    reconnectTimer = setTimeout(() => initWebSocket(onNewImage), 3000)
+    scheduleReconnect()
+  }
+}
+
+export function initWebSocket(onNewImage: (img: any) => void) {
+  listeners.add(onNewImage)
+  connect()
+
+  return () => {
+    listeners.delete(onNewImage)
+    if (listeners.size === 0) {
+      closeWebSocket()
+    }
   }
 }
 
 export function closeWebSocket() {
-  if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
   ws?.close()
+  ws = null
 }

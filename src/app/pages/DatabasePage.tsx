@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Search, RefreshCw, ChevronLeft, ChevronRight, X } from 'lucide-react';
 import { TopBar } from '../components/TopBar';
-import { apiUrl } from '../../lib/config';
+import { fetchJson, formatApiError } from '../../lib/api';
 
 // Real tables that exist in your schema
 const REAL_TABLES = [
@@ -33,17 +33,18 @@ export function DatabasePage() {
   const [selectedRow,   setSelectedRow]     = useState<any>(null);
   const [page,          setPage]            = useState(1);
   const [search,        setSearch]          = useState('');
+  const [error,         setError]          = useState('');
 
   // Fetch table metadata (row counts)
   useEffect(() => {
-    fetch(apiUrl('/db/tables'))
-      .then(r => r.json())
+    fetchJson<any[]>('/db/tables', { timeoutMs: 10000 })
       .then((tables: any[]) => {
         const meta: Record<string, any> = {};
         tables.forEach(t => { meta[t.name] = t; });
         setTableMeta(meta);
+        setError('');
       })
-      .catch(() => {});
+      .catch((e) => setError(formatApiError(e)));
   }, []);
 
   // Fetch rows when table changes
@@ -51,10 +52,9 @@ export function DatabasePage() {
     setLoading(true);
     setPage(1);
     setSelectedRow(null);
-    fetch(apiUrl(`/db/tables/${selectedTable}/rows?limit=100`))
-      .then(r => r.json())
-      .then(data => { setRows(data); setLoading(false); })
-      .catch(() => { setLoading(false); });
+    fetchJson<any[]>(`/db/tables/${selectedTable}/rows?limit=100`, { timeoutMs: 10000 })
+      .then(data => { setRows(data); setLoading(false); setError(''); })
+      .catch((e) => { setError(formatApiError(e)); setLoading(false); });
   }, [selectedTable]);
 
   const filtered = rows.filter(r =>
@@ -146,6 +146,12 @@ export function DatabasePage() {
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} style={{ color: 'var(--text-secondary)' }} />
             </button>
           </div>
+
+          {error && (
+            <div className="mx-4 mt-4 rounded-lg border p-3" style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.35)', color: '#fca5a5' }}>
+              {error}
+            </div>
+          )}
 
           <div className="flex-1 overflow-auto p-4">
             <div className="rounded-lg border overflow-hidden" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>

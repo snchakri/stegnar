@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router';
 import { TopBar } from '../components/TopBar';
 import { apiUrl, minioUrl } from '../../lib/config';
+import { fetchJson, formatApiError } from '../../lib/api';
 import { Folder, File, ChevronRight, X, ExternalLink, Download } from 'lucide-react';
 import { artifactDownloadUrl } from '../../lib/config';
 
@@ -32,16 +33,18 @@ export function StoragePage() {
   const [selected,    setSelected]    = useState<string>('');
   const [selectedFile,setSelectedFile]= useState<StorageFile | null>(null);
   const [loading,     setLoading]     = useState(true);
+  const [error,       setError]       = useState('');
 
   useEffect(() => {
-    fetch(apiUrl('/storage/buckets'))
-      .then(r => r.json())
+    fetchJson<Bucket[]>('/storage/buckets', { timeoutMs: 10000 })
       .then((data: Bucket[]) => {
         setBuckets(data);
         if (data.length > 0) setSelected(data[0].name);
         setLoading(false);
+        setError('');
       })
-      .catch(() => {
+      .catch((e) => {
+        setError(formatApiError(e));
         setBuckets([
           { name: 'stegnar-artifacts', file_count: 0, files: [] },
           { name: 'stegnar-pcaps',     file_count: 0, files: [] },
@@ -89,6 +92,13 @@ export function StoragePage() {
             <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-primary)', fontFamily: 'monospace' }}>/</span>
           </div>
           <div className="flex-1 overflow-auto">
+            {error && (
+              <div className="p-4">
+                <div className="rounded-lg border p-3" style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.35)', color: '#fca5a5' }}>
+                  storage unavailable: {error}
+                </div>
+              </div>
+            )}
             {loading ? (
               <div className="p-8 text-center" style={{ color: 'var(--text-muted)' }}>Loading MinIO…</div>
             ) : currentFiles.length === 0 ? (

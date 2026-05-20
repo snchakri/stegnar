@@ -2,12 +2,8 @@
 soc-api/server.py
 Run: python server.py
 Port: 3001
-
-SOC REST + WebSocket API for the Stegnar vTBP dashboard.
-All endpoints log at DEBUG/INFO level for full pipeline traceability.
 """
 
-import io
 import json
 import logging
 import os
@@ -15,203 +11,523 @@ import pathlib
 import socket
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 import urllib3
+import shutil
+import traceback
 
 import psycopg2
 import psycopg2.extras
 import redis as redis_lib
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sock import Sock
-import grpc
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'proto')))
-try:
-    import proto.stegnar_pb2 as pb
-    import proto.stegnar_pb2_grpc as pbg
-except ImportError as e:
-    logger.error("Failed to import grpc stubs: %s", e)
-    pb = None
-    pbg = None
+import io
+import tarfile
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+try:
+    import docker as docker_sdk
+except Exception:
+    docker_sdk = None
+
 app  = Flask(__name__)
 CORS(app)
 sock = Sock(app)
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    level=os.getenv("SOC_API_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger("stegnar.soc-api")
+logger = logging.getLogger("soc-api")
 
-# ── Environment ───────────────────────────────────────────────────────────────
-PG_HOST = os.getenv("PG_HOST", "localhost")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB   = os.getenv("PG_DB",   "stegnar")
-PG_USER = os.getenv("PG_USER", "stegnar")
-PG_PASS = os.getenv("PG_PASS", "stegnar_secret")
-
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-
+PG_HOST = os.getenv("PG_HOST", "localhost"); PG_PORT = int(os.getenv("PG_PORT", "5432")); PG_DB = os.getenv("PG_DB", "stegnar")
+PG_USER = os.getenv("PG_USER", "stegnar");  PG_PASS = os.getenv("PG_PASS", "stegnar_secret")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost"); REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
-MINIO_ACCESS   = os.getenv("MINIO_ACCESS",   "stegnar")   # matches docker-compose
-MINIO_SECRET   = os.getenv("MINIO_SECRET",   "stegnar_minio_secret")
-
+MINIO_ACCESS   = os.getenv("MINIO_ACCESS", "stegnar"); MINIO_SECRET = os.getenv("MINIO_SECRET", "stegnar_minio_secret")
 TEMP_DIR = os.getenv("SOC_API_TEMP_DIR", tempfile.gettempdir())
+SOC_API_LOG_FILE = os.getenv("SOC_API_LOG_FILE", "/var/log/stegnar/soc-api.log")
+PROXY_LOG_FILE = os.getenv("PROXY_LOG_FILE", "/var/log/stegnar/proxy.log")
+INGEST_TIMEOUT_SEC = int(os.getenv("INGEST_TIMEOUT_SEC", "300"))
+INGEST_EPHEMERAL = os.getenv("INGEST_EPHEMERAL", "true").strip().lower() in ("1", "true", "yes", "on")
+INGEST_MITM_CONTAINER = os.getenv("INGEST_MITM_CONTAINER", "stegnar-mitm")
+INGEST_MITM_IMAGE = os.getenv("INGEST_MITM_IMAGE", "")
+INGEST_NETWORK = os.getenv("INGEST_NETWORK", "").strip()
+INGEST_SAMPLE_IMAGE = os.getenv("INGEST_SAMPLE_IMAGE", "/test_images/cover_test00001.jpg")
+CALPA_MODEL_PATH = os.getenv("CALPA_MODEL_PATH", "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt")
+CALPA_CFG_PATH = os.getenv("CALPA_CFG_PATH", "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg")
+CALPA_LIBS_PATH = os.getenv("CALPA_LIBS_PATH", "/calpa/libs")
 
-logger.info(
-    "[SOC-API] Config — PG=%s:%d/%s Redis=%s:%d MinIO=%s",
-    PG_HOST, PG_PORT, PG_DB, REDIS_HOST, REDIS_PORT, MINIO_ENDPOINT,
-)
+INGEST_JOBS = {}
+INGEST_LOCK = threading.Lock()
+
+SETTINGS_STATE = {
+    "alertThreshold": 70,
+    "autoRefresh": True,
+    "retentionDays": 90,
+    "maxConcurrentScans": 10,
+    "enableNotifications": True,
+    "enableEmailAlerts": False,
+    "enableAuditLog": True,
+}
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+class WorkerRunError(RuntimeError):
+    def __init__(self, message: str, stdout: str = "", stderr: str = ""):
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _tail_file(path: str, limit: int = 200) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+        return [line.rstrip("\n") for line in lines[-limit:]]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        logger.exception("event=tail_file_failed path=%s limit=%s", path, limit)
+        return []
+
+
+def _docker_available() -> bool:
+    # Prefer verifying the Docker SDK can connect to the daemon via the
+    # mounted socket. Fall back to checking for the `docker` binary.
+    if docker_sdk is not None:
+        try:
+            client = docker_sdk.from_env()
+            # ping the daemon to ensure connectivity
+            client.ping()
+            return True
+        except Exception:
+            pass
+    return shutil.which("docker") is not None
+
+
+def _run_docker_command(args: list[str], *, timeout: int = 5, input_text: str | None = None):
+    if not _docker_available():
+        raise FileNotFoundError("docker binary not available in container")
+    logger.info("event=docker_command args=%s", " ".join(args))
+    return subprocess.run(
+        ["docker", *args],
+        input=input_text,
+        capture_output=True,
+        timeout=timeout,
+        text=True,
+    )
+
+
+def _docker_inspect_json(container_name: str) -> dict:
+    if docker_sdk is not None:
+        try:
+            client = docker_sdk.from_env()
+            container = client.containers.get(container_name)
+            return container.attrs
+        except Exception:
+            logger.exception("event=docker_sdk_inspect_failed container=%s", container_name)
+    proc = _run_docker_command(["inspect", container_name], timeout=8)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or f"docker inspect failed for {container_name}").strip())
+    payload = json.loads(proc.stdout or "[]")
+    return payload[0] if payload else {}
+
+
+def _docker_version_info() -> dict:
+    if not _docker_available():
+        return {"available": False, "version": None, "error": "docker not available"}
+    if docker_sdk is not None:
+        try:
+            client = docker_sdk.from_env()
+            info = client.version()
+            return {"available": True, "version": info.get("Version"), "raw": info}
+        except Exception:
+            logger.exception("event=docker_sdk_version_failed")
+    proc = _run_docker_command(["--version"], timeout=5)
+    return {
+        "available": proc.returncode == 0,
+        "version": (proc.stdout or proc.stderr or "").strip() or None,
+        "returncode": proc.returncode,
+    }
+
+
+def _docker_networks() -> list[str]:
+    if not _docker_available():
+        return []
+    if docker_sdk is not None:
+        try:
+            client = docker_sdk.from_env()
+            networks = client.networks.list()
+            return [n.name for n in networks]
+        except Exception:
+            logger.exception("event=docker_sdk_network_list_failed")
+    proc = _run_docker_command(["network", "ls", "--format", "{{.Name}}"], timeout=5)
+    if proc.returncode != 0:
+        logger.warning("event=docker_network_ls_failed stderr=%s", (proc.stderr or "").strip())
+        return []
+    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def _resolve_ingest_network() -> str:
+    if INGEST_NETWORK:
+        return INGEST_NETWORK
+    try:
+        inspect = _docker_inspect_json(INGEST_MITM_CONTAINER)
+        networks = list(((inspect.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+        if networks:
+            return networks[0]
+    except Exception:
+        logger.exception("event=resolve_ingest_network_failed container=%s", INGEST_MITM_CONTAINER)
+    return "stegnar-net"
+
+
+def _tail_logs_from_container_or_file(container_name: str, log_file: str, limit: int = 200) -> tuple[str, list[str]]:
+    file_lines = _tail_file(log_file, limit)
+    if file_lines:
+        return ("file", file_lines)
+    if _docker_available():
+        if docker_sdk is not None:
+            try:
+                client = docker_sdk.from_env()
+                container = client.containers.get(container_name)
+                raw = container.logs(tail=limit).decode("utf-8", errors="replace")
+                lines = [line for line in raw.splitlines() if line.strip()]
+                if lines:
+                    return ("docker", lines[-limit:])
+            except Exception:
+                logger.exception("event=docker_sdk_logs_failed container=%s", container_name)
+        try:
+            proc = _run_docker_command(["logs", "--tail", str(limit), container_name], timeout=8)
+            raw = (proc.stdout or "") + (proc.stderr or "")
+            lines = [line for line in raw.splitlines() if line.strip()]
+            if lines:
+                return ("docker", lines[-limit:])
+        except Exception:
+            logger.exception("event=docker_logs_failed container=%s", container_name)
+    return ("unavailable", [])
+
+
+def _docker_get_container(name: str):
+    if docker_sdk is None:
+        return None
+    try:
+        client = docker_sdk.from_env()
+        return client.containers.get(name)
+    except Exception:
+        logger.exception("event=docker_sdk_container_get_failed container=%s", name)
+        return None
+
 def pg():
     return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB,
-        user=PG_USER, password=PG_PASS, connect_timeout=3,
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=PG_DB,
+        user=PG_USER,
+        password=PG_PASS,
+        connect_timeout=2,
     )
 
 def rd():
     return redis_lib.Redis(
-        host=REDIS_HOST, port=REDIS_PORT,
-        decode_responses=True, socket_connect_timeout=2, socket_timeout=2,
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=1,
+        socket_timeout=1,
     )
 
 def minio_client():
     from minio import Minio
-    minio_host, minio_port = (MINIO_ENDPOINT.split(":", 1) + ["9000"])[:2]
     return Minio(
         MINIO_ENDPOINT,
         access_key=MINIO_ACCESS,
         secret_key=MINIO_SECRET,
         secure=False,
-        http_client=urllib3.PoolManager(timeout=urllib3.Timeout(connect=2.0, read=5.0)),
-    )
-
-def minio_s3_client():
-    """boto3 S3 client for presigned URLs."""
-    import boto3
-    protocol = "http"
-    return boto3.client(
-        "s3",
-        endpoint_url=f"{protocol}://{MINIO_ENDPOINT}",
-        aws_access_key_id=MINIO_ACCESS,
-        aws_secret_access_key=MINIO_SECRET,
+        http_client=urllib3.PoolManager(timeout=urllib3.Timeout(connect=1.0, read=2.0)),
     )
 
 def _is_port_open(host: str, port: int, timeout_sec: float = 0.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout_sec):
             return True
-    except Exception:
+    except Exception as exc:
+        logger.debug("event=port_check_failed host=%s port=%s error=%s", host, port, exc)
         return False
 
-def _parse_s3_uri(uri: str):
-    """Parse 's3://bucket/key' into (bucket, key). Returns (None, None) on failure."""
-    if not uri or not uri.startswith("s3://"):
-        return None, None
-    parts = uri[5:].split("/", 1)
-    if len(parts) < 2:
-        return parts[0], ""
-    return parts[0], parts[1]
+
+def _job_set(job_id: str, **fields):
+    with INGEST_LOCK:
+        if job_id not in INGEST_JOBS:
+            INGEST_JOBS[job_id] = {"job_id": job_id, "created_at": int(time.time() * 1000)}
+        INGEST_JOBS[job_id].update(fields)
 
 
-# ── Health ─────────────────────────────────────────────────────────────────────
+def _resolve_mitm_image() -> str:
+    if INGEST_MITM_IMAGE:
+        return INGEST_MITM_IMAGE
+    try:
+        if docker_sdk is not None:
+            try:
+                client = docker_sdk.from_env()
+                container = client.containers.get(INGEST_MITM_CONTAINER)
+                img = (container.attrs.get("Config") or {}).get("Image")
+                if img:
+                    return img
+            except Exception:
+                logger.exception("event=docker_sdk_resolve_mitm_image_failed container=%s", INGEST_MITM_CONTAINER)
+        # Fallback to docker CLI inspect
+        proc = subprocess.run(
+            ["docker", "inspect", "-f", "{{.Config.Image}}", INGEST_MITM_CONTAINER],
+            capture_output=True,
+            timeout=5,
+            text=True,
+        )
+        img = (proc.stdout or "").strip()
+        if proc.returncode == 0 and img:
+            return img
+    except Exception:
+        logger.exception("event=resolve_mitm_image_failed container=%s", INGEST_MITM_CONTAINER)
+    return "stegnar/mitm-gateway:latest"
+
+
+def _put_archive_bytes(client, container_id: str, target_dir: str, filename: str, data: bytes) -> None:
+    tarstream = io.BytesIO()
+    with tarfile.TarFile(fileobj=tarstream, mode='w') as tar:
+        tarinfo = tarfile.TarInfo(name=filename)
+        tarinfo.size = len(data)
+        tarinfo.mtime = int(time.time())
+        tar.addfile(tarinfo, io.BytesIO(data))
+    tarstream.seek(0)
+    ok = client.api.put_archive(container_id, target_dir, tarstream.getvalue())
+    if not ok:
+        raise RuntimeError("docker put_archive failed")
+
+
+def _run_calpa_for_image(local_path: str, artifact_id: str):
+    suffix = pathlib.Path(local_path).suffix.lower() or ".jpg"
+    payload = json.dumps({
+        "image_path": f"/tmp/ingest_upload{suffix}",
+        "model_path": CALPA_MODEL_PATH,
+        "cfg_path": CALPA_CFG_PATH,
+        "libs_path": CALPA_LIBS_PATH,
+        "artifact_id": artifact_id,
+    })
+
+    if docker_sdk is None:
+        raise RuntimeError("docker SDK not available inside soc-api container")
+
+    if INGEST_EPHEMERAL:
+        container_name = f"stegnar-ingest-{uuid.uuid4().hex[:10]}"
+        image_name = _resolve_mitm_image()
+        network_name = _resolve_ingest_network()
+        container = None
+        try:
+            client = docker_sdk.from_env()
+            container = client.containers.create(
+                image=image_name,
+                name=container_name,
+                command=["/bin/sh", "-lc", "sleep 600"],
+                network=network_name,
+                detach=True,
+            )
+            container.start()
+
+            img_data = pathlib.Path(local_path).read_bytes()
+            _put_archive_bytes(client, container.id, "/tmp", f"ingest_upload{suffix}", img_data)
+            _put_archive_bytes(client, container.id, "/tmp", "ingest_payload.json", payload.encode())
+
+            exec_result = container.exec_run(
+                ["/bin/sh", "-lc", "/opt/tf1/bin/python3.7 /app/calpa_worker.py < /tmp/ingest_payload.json"],
+                environment={"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"},
+                demux=True,
+            )
+            stdout_bytes, stderr_bytes = exec_result.output or (b"", b"")
+            class _P: pass
+            run_proc = _P()
+            run_proc.returncode = exec_result.exit_code
+            run_proc.stdout = (stdout_bytes or b"").decode("utf-8", errors="replace")
+            run_proc.stderr = (stderr_bytes or b"").decode("utf-8", errors="replace")
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception as exc:
+                    logger.debug("event=ephemeral_container_cleanup_failed container=%s error=%s", container_name, exc)
+    else:
+        try:
+            client = docker_sdk.from_env()
+            container = client.containers.get(INGEST_MITM_CONTAINER)
+            img_data = pathlib.Path(local_path).read_bytes()
+            _put_archive_bytes(client, container.id, "/tmp", f"ingest_upload{suffix}", img_data)
+            _put_archive_bytes(client, container.id, "/tmp", "ingest_payload.json", payload.encode())
+
+            exec_result = container.exec_run(
+                ["/bin/sh", "-lc", "/opt/tf1/bin/python3.7 /app/calpa_worker.py < /tmp/ingest_payload.json"],
+                environment={"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"},
+                demux=True,
+            )
+            stdout_bytes, stderr_bytes = exec_result.output or (b"", b"")
+            class _P: pass
+            run_proc = _P()
+            run_proc.returncode = exec_result.exit_code
+            run_proc.stdout = (stdout_bytes or b"").decode("utf-8", errors="replace")
+            run_proc.stderr = (stderr_bytes or b"").decode("utf-8", errors="replace")
+        except Exception:
+            logger.exception("event=docker_sdk_exec_failed container=%s", INGEST_MITM_CONTAINER)
+            raise RuntimeError("docker exec via SDK failed")
+
+    stdout = (run_proc.stdout or "").strip()
+    stderr = (run_proc.stderr or "").strip()
+    if run_proc.returncode != 0:
+        raise RuntimeError(f"worker_failed rc={run_proc.returncode} stderr={stderr[:240]}")
+    if not stdout:
+        raise RuntimeError("worker_empty_stdout")
+
+    parsed = json.loads(stdout)
+    predicted = parsed.get("predicted_label", "UNKNOWN")
+    confidence = float(parsed.get("confidence", 0.0))
+    latency_ms = float(parsed.get("latency_ms", 0.0))
+
+    return {
+        "predicted_label": predicted,
+        "confidence": confidence,
+        "latency_ms": latency_ms,
+        "classification": "MALICIOUS" if predicted == "STEGO" else "BENIGN",
+        "message": "CALPA analysis completed",
+        "worker_mode": "ephemeral" if INGEST_EPHEMERAL else "exec",
+    }
+
+
+def _start_ingest_image_job(upload_path: str, original_name: str):
+    job_id = f"ingest_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    _job_set(job_id, status="queued", kind="image", filename=original_name)
+
+    def _run():
+        _job_set(job_id, status="running", started_at=int(time.time() * 1000))
+        try:
+            result = _run_calpa_for_image(upload_path, original_name)
+            _job_set(job_id, status="completed", completed_at=int(time.time() * 1000), result=result)
+        except Exception as e:
+            _job_set(job_id, status="failed", completed_at=int(time.time() * 1000), error=str(e))
+        finally:
+            pathlib.Path(upload_path).unlink(missing_ok=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return job_id
+
+
+def _start_ingest_pcap_job(pcap_path: str, key_path: str, pcap_name: str, key_name: str):
+    job_id = f"pcap_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    _job_set(job_id, status="queued", kind="pcap", pcap=pcap_name, keys=key_name)
+
+    def _run():
+        _job_set(job_id, status="running", started_at=int(time.time() * 1000))
+        try:
+            pcap_size = pathlib.Path(pcap_path).stat().st_size
+            key_size = pathlib.Path(key_path).stat().st_size
+            result = {
+                "classification": "UNKNOWN",
+                "confidence": 0.0,
+                "message": "PCAP and key files accepted for forensic workflow",
+                "pcap_bytes": pcap_size,
+                "key_bytes": key_size,
+            }
+            _job_set(job_id, status="completed", completed_at=int(time.time() * 1000), result=result)
+        except Exception as e:
+            _job_set(job_id, status="failed", completed_at=int(time.time() * 1000), error=str(e))
+        finally:
+            pathlib.Path(pcap_path).unlink(missing_ok=True)
+            pathlib.Path(key_path).unlink(missing_ok=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return job_id
+
+
 @app.get("/api/health")
 def health():
+    services = []
     minio_host, minio_port = (MINIO_ENDPOINT.split(":", 1) + ["9000"])[:2]
-    services = [
-        {"name": "PostgreSQL",     "status": "online" if _is_port_open(PG_HOST, PG_PORT)          else "offline", "port": PG_PORT},
-        {"name": "Redis",          "status": "online" if _is_port_open(REDIS_HOST, REDIS_PORT)     else "offline", "port": REDIS_PORT},
-        {"name": "MinIO",          "status": "online" if _is_port_open(minio_host, int(minio_port)) else "offline", "port": int(minio_port)},
-        {"name": "MITM Gateway",   "status": "online", "port": 50052},
-        {"name": "Routing System", "status": "online", "port": 50051},
-        {"name": "CALPA Model",    "status": "online", "port": 0},
-    ]
-    logger.debug("[health] %s", {s["name"]: s["status"] for s in services})
+    services.append({"name":"PostgreSQL","status":"online" if _is_port_open(PG_HOST, PG_PORT) else "offline","port":PG_PORT})
+    services.append({"name":"Redis","status":"online" if _is_port_open(REDIS_HOST, REDIS_PORT) else "offline","port":REDIS_PORT})
+    services.append({"name":"MinIO","status":"online" if _is_port_open(minio_host, int(minio_port)) else "offline","port":int(minio_port)})
+    services.append({"name":"MITM Gateway","status":"online","port":50052})
+    services.append({"name":"Routing System","status":"online","port":50051})
+    services.append({"name":"CALPA Model","status":"online","port":0})
     return jsonify({"services": services})
 
 
-# ── Database ──────────────────────────────────────────────────────────────────
+@app.get("/api/admin/diagnostics")
+def admin_diagnostics():
+    docker_info = _docker_version_info()
+    soc_source, soc_logs = _tail_logs_from_container_or_file("stegnar-soc-api", SOC_API_LOG_FILE)
+    proxy_source, proxy_logs = _tail_logs_from_container_or_file("stegnar-proxy", PROXY_LOG_FILE)
+    return jsonify({
+        "docker_available": docker_info.get("available", False),
+        "docker_version": docker_info.get("version"),
+        "docker_info": docker_info,
+        "ingest_network": _resolve_ingest_network(),
+        "ingest_mitm_container": INGEST_MITM_CONTAINER,
+        "docker_networks": _docker_networks(),
+        "soc_api_logs": soc_logs,
+        "soc_api_log_source": soc_source,
+        "proxy_logs": proxy_logs,
+        "proxy_log_source": proxy_source,
+    })
+
+
 @app.get("/api/db/tables")
 def db_tables():
-    logger.debug("[db_tables] request")
     try:
-        conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT t.tablename AS name,
-                   COALESCE(s.n_live_tup, 0) AS row_count,
-                   COALESCE(s.last_autoanalyze, NOW())::text AS last_write
-            FROM pg_tables t
-            LEFT JOIN pg_stat_user_tables s ON s.relname = t.tablename
-            WHERE t.schemaname = 'public'
-            ORDER BY row_count DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        logger.debug("[db_tables] returned %d tables", len(rows))
+            SELECT t.tablename AS name, COALESCE(s.n_live_tup,0) AS row_count,
+                   COALESCE(s.last_autoanalyze,NOW())::text AS last_write
+            FROM pg_tables t LEFT JOIN pg_stat_user_tables s ON s.relname=t.tablename
+            WHERE t.schemaname='public' ORDER BY row_count DESC""")
+        rows = cur.fetchall(); conn.close()
         return jsonify([dict(r) for r in rows])
-    except Exception as e:
-        logger.error("[db_tables] ERROR: %s", e)
-        return jsonify([])
+    except Exception:
+        logger.exception("event=db_tables_failed")
+        return jsonify({"error": "database unavailable"}), 500
 
 
 @app.get("/api/db/tables/<table_name>/rows")
 def db_rows(table_name):
-    allowed = ["network_events", "hash_cache", "endpoint_registry"]
-    if table_name not in allowed:
-        logger.warning("[db_rows] Blocked access to table: %s", table_name)
-        return jsonify({"error": "not allowed"}), 403
-    limit = min(int(request.args.get("limit", 100)), 500)
-    logger.debug("[db_rows] table=%s limit=%d", table_name, limit)
+    if table_name not in ["network_events","hash_cache","endpoint_registry"]:
+        return jsonify({"error":"not allowed"}), 403
+    limit = min(int(request.args.get("limit",100)), 500)
     try:
-        conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(f"SELECT * FROM {table_name} ORDER BY 1 DESC LIMIT %s", (limit,))
         rows = cur.fetchall()
-        conn.close()
-        result = []
-        for r in rows:
-            row = {}
-            for k, v in dict(r).items():
-                row[k] = str(v) if hasattr(v, "isoformat") else v
-            result.append(row)
-        logger.debug("[db_rows] table=%s returned %d rows", table_name, len(result))
-        return jsonify(result)
-    except Exception as e:
-        logger.error("[db_rows] ERROR table=%s: %s", table_name, e)
+    except Exception:
+        logger.exception("event=db_rows_failed table=%s", table_name)
         try: conn.close()
-        except: pass
-        return jsonify([])
+        except Exception:
+            pass
+        return jsonify({"error": "database unavailable"}), 500
+    conn.close()
+    result = []
+    for r in rows:
+        row = {}
+        for k,v in dict(r).items(): row[k] = str(v) if hasattr(v,"isoformat") else v
+        result.append(row)
+    return jsonify(result)
 
 
-# ── Redis ─────────────────────────────────────────────────────────────────────
 @app.get("/api/redis/stats")
 def redis_stats():
     if not _is_port_open(REDIS_HOST, REDIS_PORT):
-        logger.warning("[redis_stats] Redis offline")
-        return jsonify({"total_keys": 0, "memory_used": 0, "memory_max": 536870912, "connections": 0})
+        return jsonify({"total_keys":0,"memory_used":0,"memory_max":536870912,"connections":0})
     try:
-        r = rd()
-        mem = r.info("memory")
-        clients = r.info("clients")
-        stats = {
-            "total_keys":   r.dbsize(),
-            "memory_used":  mem.get("used_memory", 0),
-            "memory_max":   mem.get("maxmemory", 536870912),
-            "connections":  clients.get("connected_clients", 0),
-        }
-        logger.debug("[redis_stats] %s", stats)
-        return jsonify(stats)
-    except Exception as e:
-        logger.error("[redis_stats] ERROR: %s", e)
-        return jsonify({"total_keys": 0, "memory_used": 0, "memory_max": 536870912, "connections": 0})
+        r = rd(); mem = r.info("memory"); clients = r.info("clients")
+        return jsonify({"total_keys":r.dbsize(),"memory_used":mem.get("used_memory",0),
+                        "memory_max":mem.get("maxmemory",536870912),"connections":clients.get("connected_clients",0)})
+    except Exception:
+        logger.exception("event=redis_stats_failed")
+        return jsonify({"total_keys":0,"memory_used":0,"memory_max":536870912,"connections":0})
 
 
 @app.get("/api/redis/keys")
@@ -219,672 +535,469 @@ def redis_keys():
     if not _is_port_open(REDIS_HOST, REDIS_PORT):
         return jsonify([])
     try:
-        r = rd()
-        result = []
-        for key in r.keys("*")[:50]:
-            ktype = r.type(key)
-            ttl   = r.ttl(key)
-            value = None
-            if ktype == "hash":   value = r.hgetall(key)
+        r = rd(); result = []
+        # r.keys can return None or very large lists; handle defensively
+        keys = r.keys("*") or []
+        for key in keys[:50]:
+            ktype = r.type(key); ttl = r.ttl(key); value = None
+            if ktype == "hash": value = r.hgetall(key)
             elif ktype == "string": value = r.get(key)
             elif ktype == "stream":
-                msgs  = r.xrange(key, "-", "+", count=5)
-                value = [{"id": m[0], "fields": m[1]} for m in msgs]
-            group = (
-                "IMAGE CACHE" if key.startswith("img_cache")  else
-                "RATE LIMIT"  if key.startswith("rate_limit") else
-                "HASH CACHE"  if key.startswith("stegnar:cache:") else
-                "STREAMS"     if key.startswith("stegnar:")   else
-                "SETTINGS"    if key.startswith("stegnar:settings") else "OTHER"
-            )
-            result.append({"name": key, "type": ktype, "ttl": None if ttl == -1 else ttl, "group": group, "value": value})
-        logger.debug("[redis_keys] returned %d keys", len(result))
+                msgs = r.xrange(key,"-","+",count=5)
+                value = [{"id":m[0],"fields":m[1]} for m in msgs]
+            # Normalize commonly used cache prefixes so UI shows counts
+            group = ("IMAGE CACHE" if key.startswith("img_cache") or key.startswith("stegnar:cache") else
+                     "RATE LIMIT"  if key.startswith("rate_limit") else
+                     "STREAMS"     if key.startswith("stegnar:")   else "OTHER")
+            result.append({"name":key,"type":ktype,"ttl":None if ttl==-1 else ttl,"group":group,"value":value})
         return jsonify(result)
-    except Exception as e:
-        logger.error("[redis_keys] ERROR: %s", e)
+    except Exception:
+        logger.exception("event=redis_keys_failed")
         return jsonify([])
 
 
-# ── Images (network_events with image_uri) ────────────────────────────────────
 @app.get("/api/images")
 def images():
-    verdict     = request.args.get("classification", "")
-    hash_search = request.args.get("hash", "")
-    logger.debug("[images] classification=%s hash=%s", verdict, hash_search)
+    verdict = request.args.get("classification",""); hash_search = request.args.get("hash","")
     try:
-        conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        query = """
-            SELECT event_id AS id, ts AS first_seen_ts, endpoint_id,
-                   src_ip, dst_ip, sha256 AS sha256_hash,
-                   steg_score AS calpa_score, verdict AS classification,
-                   latency_ms, model_type,
-                   image_uri AS minio_img_uri,
-                   pcap_uri  AS minio_pcap_uri,
-                   stream_id
-            FROM network_events
-            WHERE image_uri IS NOT NULL AND image_uri != '' AND image_uri NOT LIKE 'error://%'
-        """
+        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        query = """SELECT event_id AS id, ts AS first_seen_ts, endpoint_id, src_ip, dst_ip,
+                   sha256 AS sha256_hash, steg_score AS calpa_score, verdict AS classification,
+                   latency_ms, model_type, image_uri AS minio_img_uri, pcap_uri AS minio_pcap_uri,
+                   stream_id FROM network_events WHERE image_uri IS NOT NULL"""
         params = []
-        if verdict and verdict not in ("all", ""):
-            mapping = {"malicious": "STEGO", "benign": "CLEAN", "suspicious": "AMBIGUOUS"}
-            params.append(mapping.get(verdict, verdict.upper()))
-            query += " AND verdict = %s"
-        if hash_search:
-            params.append(f"%{hash_search}%")
-            query += " AND sha256 ILIKE %s"
+        if verdict and verdict not in ("all",""):
+            mapping = {"malicious":"STEGO","benign":"CLEAN","suspicious":"AMBIGUOUS"}
+            params.append(mapping.get(verdict, verdict.upper())); query += " AND verdict = %s"
+        if hash_search: params.append(f"%{hash_search}%"); query += " AND sha256 ILIKE %s"
         query += " ORDER BY ts DESC LIMIT 100"
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-    except Exception as e:
-        logger.error("[images] DB error: %s", e)
+        cur.execute(query, params); rows = cur.fetchall(); conn.close()
+    except Exception:
+        logger.exception("event=images_failed")
         rows = []
-    v_map = {"STEGO": "malicious", "CLEAN": "benign", "AMBIGUOUS": "suspicious"}
-    result = []
+    v_map = {"STEGO":"malicious","CLEAN":"benign","AMBIGUOUS":"suspicious"}; result = []
     for r in rows:
         row = dict(r)
-        for k, v in row.items():
-            if hasattr(v, "isoformat"):
-                row[k] = v.isoformat()
-        row["classification"] = v_map.get(row.get("classification", ""), "benign")
+        for k,v in row.items():
+            if hasattr(v,"isoformat"): row[k] = v.isoformat()
+        row["classification"] = v_map.get(row.get("classification",""),"benign")
         result.append(row)
-    logger.info("[images] returned %d image records", len(result))
     return jsonify(result)
 
 
-# ── Artifact proxy — presigned URL & download ─────────────────────────────────
-@app.get("/api/artifacts/<bucket>/<path:obj_key>")
-def artifact_redirect(bucket, obj_key):
-    """Generate a presigned MinIO URL and redirect the browser to it."""
-    logger.info("[artifact_redirect] bucket=%s key=%s", bucket, obj_key)
-    try:
-        s3 = minio_s3_client()
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": obj_key},
-            ExpiresIn=3600,
-        )
-        logger.debug("[artifact_redirect] presigned URL: %s", url[:80])
-        return Response(
-            status=302,
-            headers={"Location": url},
-        )
-    except Exception as e:
-        logger.error("[artifact_redirect] FAILED bucket=%s key=%s: %s", bucket, obj_key, e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.get("/api/artifacts/<bucket>/<path:obj_key>/download")
-def artifact_download(bucket, obj_key):
-    """Stream artifact bytes through this server with Content-Disposition: attachment."""
-    logger.info("[artifact_download] bucket=%s key=%s", bucket, obj_key)
-    try:
-        s3   = minio_s3_client()
-        resp = s3.get_object(Bucket=bucket, Key=obj_key)
-        data = resp["Body"].read()
-        filename = obj_key.split("/")[-1]
-        logger.info("[artifact_download] Streaming %d bytes as %s", len(data), filename)
-        return Response(
-            data,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Type": resp.get("ContentType", "application/octet-stream"),
-                "Content-Length": str(len(data)),
-            },
-        )
-    except Exception as e:
-        logger.error("[artifact_download] FAILED bucket=%s key=%s: %s", bucket, obj_key, e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.get("/api/artifact-url")
-def artifact_url_from_s3():
-    """
-    Given a full s3:// URI, generate a presigned URL.
-    Query param: uri=s3://bucket/key
-    Returns: { url: "https://..." }
-    """
-    uri = request.args.get("uri", "")
-    logger.debug("[artifact_url_from_s3] uri=%s", uri)
-    if not uri.startswith("s3://"):
-        return jsonify({"error": "invalid uri — must start with s3://"}), 400
-    bucket, key = _parse_s3_uri(uri)
-    if not bucket or not key:
-        return jsonify({"error": "could not parse bucket/key"}), 400
-    try:
-        s3  = minio_s3_client()
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=3600,
-        )
-        logger.debug("[artifact_url_from_s3] presigned: %s", url[:80])
-        return jsonify({"url": url})
-    except Exception as e:
-        logger.error("[artifact_url_from_s3] FAILED uri=%s: %s", uri, e)
-        return jsonify({"error": str(e)}), 500
-
-
-# ── Logs ──────────────────────────────────────────────────────────────────────
 @app.get("/api/logs")
 def logs():
-    endpoint = request.args.get("component", "")
-    search   = request.args.get("search",    "")
-    logger.debug("[logs] component=%s search=%s", endpoint, search)
+    endpoint = request.args.get("component",""); search = request.args.get("search","")
     try:
-        conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        query = """
-            SELECT event_id AS log_id, ts AS timestamp,
-                   endpoint_id AS component, verdict AS action,
-                   json_build_object(
-                       'sha256',     sha256,
-                       'src_ip',     src_ip,
-                       'dst_ip',     dst_ip,
-                       'steg_score', steg_score,
-                       'latency_ms', latency_ms,
-                       'stream_id',  stream_id,
-                       'image_uri',  image_uri,
-                       'pcap_uri',   pcap_uri
-                   ) AS details
-            FROM network_events WHERE 1=1
-        """
+        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        query = """SELECT event_id AS log_id, ts AS timestamp, endpoint_id AS component, verdict AS action,
+                   json_build_object('sha256',sha256,'src_ip',src_ip,'dst_ip',dst_ip,
+                   'steg_score',steg_score,'latency_ms',latency_ms,'stream_id',stream_id) AS details
+                   FROM network_events WHERE 1=1"""
         params = []
-        if endpoint and endpoint not in ("all", ""):
-            params.append(endpoint)
-            query += " AND endpoint_id = %s"
+        if endpoint and endpoint not in ("all",""):
+            params.append(endpoint); query += " AND endpoint_id = %s"
         if search:
-            params += [f"%{search}%", f"%{search}%"]
+            params.append(f"%{search}%"); params.append(f"%{search}%")
             query += " AND (verdict ILIKE %s OR sha256 ILIKE %s)"
         query += " ORDER BY ts DESC LIMIT 200"
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-    except Exception as e:
-        logger.error("[logs] ERROR: %s", e)
+        cur.execute(query,params); rows = cur.fetchall(); conn.close()
+    except Exception:
+        logger.exception("event=logs_failed")
         rows = []
     result = []
     for r in rows:
         row = dict(r)
-        for k, v in row.items():
-            if hasattr(v, "isoformat"):
-                row[k] = v.isoformat()
+        for k,v in row.items():
+            if hasattr(v,"isoformat"): row[k] = v.isoformat()
         result.append(row)
-    logger.debug("[logs] returned %d log entries", len(result))
     return jsonify(result)
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/api/settings")
+def settings_get():
+    return jsonify(dict(SETTINGS_STATE))
+
+
+@app.post("/api/settings")
+def settings_post():
+    try:
+        payload = request.get_json(silent=True) or {}
+        for key in SETTINGS_STATE:
+            if key in payload:
+                SETTINGS_STATE[key] = payload[key]
+        return jsonify({"ok": True, **SETTINGS_STATE})
+    except Exception:
+        logger.exception("event=settings_update_failed")
+        return jsonify({"ok": False, "error": "failed to update settings"}), 500
+
+
 @app.get("/api/endpoints")
 def endpoints():
-    logger.debug("[endpoints] request")
     try:
-        conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT r.endpoint_id,
-                   r.ip_address AS ip,
-                   'active' AS trust_state,
-                   r.total_chunks AS images_intercepted,
-                   r.last_seen::text AS last_activity,
-                   COUNT(CASE WHEN n.verdict = 'STEGO' THEN 1 END) AS stego_count
-            FROM endpoint_registry r
-            LEFT JOIN network_events n ON r.endpoint_id = n.endpoint_id
-            GROUP BY r.endpoint_id, r.ip_address, r.total_chunks, r.last_seen
-            ORDER BY stego_count DESC
-        """)
+        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""SELECT r.endpoint_id, r.ip_address AS ip, 'active' AS trust_state,
+                       r.total_chunks AS images_intercepted, r.last_seen::text AS last_activity,
+                       COUNT(CASE WHEN n.verdict='STEGO' THEN 1 END) AS stego_count
+                       FROM endpoint_registry r
+                       LEFT JOIN network_events n ON r.endpoint_id=n.endpoint_id
+                       GROUP BY r.endpoint_id,r.ip_address,r.total_chunks,r.last_seen
+                       ORDER BY stego_count DESC""")
         rows = cur.fetchall()
-        conn.close()
-        logger.info("[endpoints] returned %d endpoints from DB", len(rows))
-        return jsonify([dict(r) for r in rows])
-    except Exception as e:
-        logger.error("[endpoints] ERROR: %s", e)
-        try: conn.close()
-        except: pass
-        return jsonify([])
+    except Exception:
+        logger.exception("event=endpoints_failed")
+        try:
+            cur.execute("""SELECT endpoint_id, endpoint_id AS ip, 'active' AS trust_state,
+                          COUNT(*) AS images_intercepted, MAX(ts)::text AS last_activity,
+                          COUNT(CASE WHEN verdict='STEGO' THEN 1 END) AS stego_count
+                          FROM network_events GROUP BY endpoint_id""")
+            rows = cur.fetchall()
+        except Exception:
+            logger.exception("event=endpoints_fallback_failed")
+            rows = []
+    try: conn.close()
+    except Exception:
+        pass
+    return jsonify([dict(r) for r in rows])
 
 
-@app.post("/api/agents/heartbeat")
-def agent_heartbeat():
-    """
-    Lightweight self-registration called by each endpoint agent on startup + periodically.
-    Upserts endpoint_registry so topology shows live nodes even before gRPC cycle completes.
-    Body: { "endpoint_id": "node-1", "ip": "172.20.0.X" }
-    """
-    body        = request.get_json(silent=True) or {}
-    endpoint_id = body.get("endpoint_id", "")
-    ip          = body.get("ip", request.remote_addr or "")
-    if not endpoint_id:
-        return jsonify({"error": "endpoint_id required"}), 400
-    logger.info("[heartbeat] endpoint=%s ip=%s", endpoint_id, ip)
-    try:
-        conn = pg()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO endpoint_registry (endpoint_id, ip_address, first_seen, last_seen, total_chunks, total_bytes)
-            VALUES (%s, %s, NOW(), NOW(), 0, 0)
-            ON CONFLICT (endpoint_id) DO UPDATE
-              SET last_seen  = NOW(),
-                  ip_address = EXCLUDED.ip_address
-        """, (endpoint_id, ip))
-        conn.commit()
-        conn.close()
-        logger.info("[heartbeat] Upserted endpoint_registry for %s", endpoint_id)
-        return jsonify({"ok": True})
-    except Exception as e:
-        logger.error("[heartbeat] DB error endpoint=%s: %s", endpoint_id, e)
-        try: conn.rollback(); conn.close()
-        except: pass
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ── Ledger ────────────────────────────────────────────────────────────────────
 @app.get("/api/ledger/events")
 def ledger_events():
-    logger.debug("[ledger_events] request")
     try:
-        conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT ROW_NUMBER() OVER (ORDER BY ts DESC) AS chain_index,
-                   event_id,
-                   'InferenceEvent' AS type,
-                   endpoint_id AS producer,
-                   ts::text AS time,
-                   verdict || ' — score: ' || ROUND(COALESCE(steg_score, 0)::numeric, 3)::text AS payload,
-                   true AS integrity
-            FROM network_events
-            ORDER BY ts DESC LIMIT 100
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        logger.info("[ledger_events] returned %d events", len(rows))
+        conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""SELECT ROW_NUMBER() OVER (ORDER BY ts DESC) AS chain_index, event_id,
+                       'InferenceEvent' AS type, endpoint_id AS producer, ts::text AS time,
+                       verdict || ' — score: ' || ROUND(COALESCE(steg_score,0)::numeric,3)::text AS payload,
+                       true AS integrity FROM network_events ORDER BY ts DESC LIMIT 100""")
+        rows = cur.fetchall(); conn.close()
         return jsonify([dict(r) for r in rows])
-    except Exception as e:
-        logger.error("[ledger_events] ERROR: %s", e)
+    except Exception:
+        logger.exception("event=ledger_events_failed")
         return jsonify([])
 
 
 @app.get("/api/ledger/integrity")
 def ledger_integrity():
-    logger.debug("[ledger_integrity] request")
     try:
-        conn = pg()
-        cur  = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM network_events")
-        count = cur.fetchone()[0]
-        conn.close()
-        logger.info("[ledger_integrity] count=%d", count)
-        return jsonify({"verified": True, "max_chain_index": count, "last_checked": "just now"})
-    except Exception as e:
-        logger.error("[ledger_integrity] ERROR: %s", e)
-        return jsonify({"verified": False, "max_chain_index": 0, "last_checked": "dependency unavailable"})
+        conn = pg(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM network_events"); count = cur.fetchone()[0]; conn.close()
+        return jsonify({"verified":True,"max_chain_index":count,"last_checked":"just now"})
+    except Exception:
+        logger.exception("event=ledger_integrity_failed")
+        return jsonify({"verified":False,"max_chain_index":0,"last_checked":"dependency unavailable"})
 
 
-# ── Storage ───────────────────────────────────────────────────────────────────
 @app.get("/api/storage/buckets")
 def storage_buckets():
-    logger.debug("[storage_buckets] request")
     minio_host, minio_port = (MINIO_ENDPOINT.split(":", 1) + ["9000"])[:2]
     if not _is_port_open(minio_host, int(minio_port)):
-        logger.warning("[storage_buckets] MinIO offline")
-        return jsonify([
-            {"name": "stegnar-artifacts", "file_count": 0, "files": []},
-            {"name": "stegnar-pcaps",     "file_count": 0, "files": []},
-        ])
+        return jsonify([{"name":"stegnar-artifacts","file_count":0,"files":[]},
+                        {"name":"stegnar-pcaps","file_count":0,"files":[]}])
     try:
         client = minio_client()
         result = []
-        for bname in ["stegnar-artifacts", "stegnar-pcaps"]:
+        for bname in ["stegnar-artifacts","stegnar-pcaps"]:
             try:
-                objects = list(client.list_objects(bname, recursive=True))
-                logger.info("[storage_buckets] bucket=%s files=%d", bname, len(objects))
-                result.append({
-                    "name":       bname,
-                    "file_count": len(objects),
-                    "files": [{
-                        "name":          o.object_name,
-                        "size":          o.size,
-                        "last_modified": str(o.last_modified),
-                        "is_dir":        o.is_dir or False,
-                        "type":          "file",
-                    } for o in objects[:50]],
-                })
-            except Exception as be:
-                logger.error("[storage_buckets] bucket=%s error: %s", bname, be)
-                result.append({"name": bname, "file_count": 0, "files": []})
+                objects = list(client.list_objects(bname,recursive=True))
+                result.append({"name":bname,"file_count":len(objects),
+                    "files":[{"name":o.object_name,"size":o.size,"last_modified":str(o.last_modified),
+                               "is_dir":o.is_dir or False,"type":"file"} for o in objects[:20]]})
+            except Exception:
+                logger.debug("event=storage_bucket_list_failed bucket=%s", bname)
+                result.append({"name":bname,"file_count":0,"files":[]})
         return jsonify(result)
-    except Exception as e:
-        logger.error("[storage_buckets] ERROR: %s", e)
-        return jsonify([
-            {"name": "stegnar-artifacts", "file_count": 0, "files": []},
-            {"name": "stegnar-pcaps",     "file_count": 0, "files": []},
-        ])
+    except Exception:
+        logger.exception("event=storage_buckets_failed")
+        return jsonify([{"name":"stegnar-artifacts","file_count":0,"files":[]},
+                        {"name":"stegnar-pcaps","file_count":0,"files":[]}])
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
+@app.get("/api/proxy/logs")
+def proxy_logs():
+    container = _docker_get_container("stegnar-proxy")
+    if container is None:
+        return jsonify([])
+    try:
+        raw = container.logs(tail=200).decode("utf-8", errors="replace")
+        lines = [line for line in raw.splitlines() if line.strip()]
+        return jsonify(lines[-200:])
+    except Exception:
+        logger.exception("event=proxy_logs_failed")
+        return jsonify([])
+
+
+@app.get("/api/proxy/metrics")
+def proxy_metrics():
+    is_running = False
+    logs = []
+    container = _docker_get_container("stegnar-proxy")
+    if container is not None:
+        try:
+            container.reload()
+            is_running = container.status == "running"
+        except Exception:
+            logger.exception("event=proxy_metrics_status_failed")
+        try:
+            raw = container.logs(tail=500).decode("utf-8", errors="replace")
+            logs = [line for line in raw.splitlines() if line.strip()]
+        except Exception:
+            logger.exception("event=proxy_metrics_logs_failed")
+
+    interceptions = 0
+    for line in logs:
+        lowered = line.lower()
+        if "clientconnect" in lowered or "serverconnect" in lowered:
+            interceptions += 1
+
+    return jsonify({
+        "status": "active" if is_running else "offline",
+        "intercepted_connections": interceptions,
+        "total_log_lines": len(logs),
+        "uptime_status": "Running" if is_running else "Offline",
+    })
+
+
 @app.get("/api/metrics/latency")
-def metrics_latency():
-    """Returns avg latency and per-minute event counts for the last 15 minutes."""
-    logger.debug("[metrics_latency] request")
+def latency_metrics():
     try:
         conn = pg()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT ROUND(AVG(latency_ms)::numeric, 1) AS avg_latency FROM network_events WHERE latency_ms > 0")
-        avg_row = cur.fetchone()
-        avg_latency = float(avg_row["avg_latency"]) if avg_row and avg_row["avg_latency"] else 0.0
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        cur.execute("""
-            SELECT date_trunc('minute', ts) AS bucket,
-                   COUNT(*) AS events
+        cur.execute(
+            """
+            SELECT COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
             FROM network_events
-            WHERE ts >= NOW() - INTERVAL '15 minutes'
-            GROUP BY bucket
-            ORDER BY bucket ASC
-        """)
-        buckets = [{"time": str(r["bucket"])[:16].replace("T", " "), "value": int(r["events"])} for r in cur.fetchall()]
+            WHERE ts >= NOW() - INTERVAL '15 minutes' AND latency_ms IS NOT NULL
+            """
+        )
+        avg_row = cur.fetchone() or {}
+        avg_latency = float(avg_row.get("avg_latency_ms") or 0.0)
+
+        cur.execute(
+            """
+            WITH minutes AS (
+                SELECT generate_series(
+                    date_trunc('minute', NOW() - INTERVAL '14 minutes'),
+                    date_trunc('minute', NOW()),
+                    INTERVAL '1 minute'
+                ) AS bucket
+            ), counts AS (
+                SELECT date_trunc('minute', ts) AS bucket, COUNT(*)::int AS value
+                FROM network_events
+                WHERE ts >= NOW() - INTERVAL '15 minutes'
+                GROUP BY 1
+            )
+            SELECT to_char(minutes.bucket, 'HH24:MI') AS time,
+                   COALESCE(counts.value, 0)::int AS value
+            FROM minutes
+            LEFT JOIN counts ON counts.bucket = minutes.bucket
+            ORDER BY minutes.bucket ASC
+            """
+        )
+        rows = cur.fetchall() or []
         conn.close()
-        logger.info("[metrics_latency] avg_latency=%.1fms buckets=%d", avg_latency, len(buckets))
-        return jsonify({"avg_latency_ms": avg_latency, "buckets": buckets})
-    except Exception as e:
-        logger.error("[metrics_latency] ERROR: %s", e)
-        return jsonify({"avg_latency_ms": 0, "buckets": []})
+
+        return jsonify({
+            "avg_latency_ms": avg_latency,
+            "buckets": [dict(r) for r in rows],
+        })
+    except Exception:
+        logger.exception("event=latency_metrics_failed")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"avg_latency_ms": 0.0, "buckets": []})
 
 
-# ── Settings (Redis-backed, runtime configurable) ─────────────────────────────
-SETTINGS_KEY     = "stegnar:settings"
-DEFAULT_SETTINGS = {
-    "alertThreshold":      70,
-    "retentionDays":       90,
-    "maxConcurrentScans":  10,
-    "autoRefresh":         True,
-    "enableNotifications": True,
-    "enableEmailAlerts":   False,
-    "enableAuditLog":      True,
-}
-
-@app.get("/api/settings")
-def get_settings():
-    logger.debug("[get_settings] request")
-    try:
-        r    = rd()
-        raw  = r.get(SETTINGS_KEY)
-        if raw:
-            data = json.loads(raw)
-            logger.debug("[get_settings] loaded from Redis: %s", data)
-            return jsonify(data)
-        # return defaults on first run
-        logger.info("[get_settings] no saved settings — returning defaults")
-        return jsonify(DEFAULT_SETTINGS)
-    except Exception as e:
-        logger.error("[get_settings] ERROR: %s", e)
-        return jsonify(DEFAULT_SETTINGS)
-
-
-@app.post("/api/settings")
-def save_settings():
-    body = request.get_json(silent=True) or {}
-    logger.info("[save_settings] payload=%s", body)
-    # Merge with defaults so unknown keys don't corrupt
-    merged = {**DEFAULT_SETTINGS, **body}
+@app.get("/api/metrics/pipeline")
+def pipeline_metrics():
+    stream = "stegnar:db_queue"
+    pending = 0
+    total = 0
+    group_count = 0
     try:
         r = rd()
-        r.set(SETTINGS_KEY, json.dumps(merged))
-        logger.info("[save_settings] Saved to Redis key=%s", SETTINGS_KEY)
-        return jsonify({"ok": True, "settings": merged})
+        total = int(r.xlen(stream))
+        groups = r.xinfo_groups(stream)
+        group_count = len(groups)
+        pending = sum(int(g.get("pending", 0)) for g in groups)
+    except redis_lib.exceptions.ResponseError:
+        # stream does not exist yet
+        pass
+    except Exception:
+        logger.exception("event=pipeline_metrics_redis_failed")
+
+    db_events = 0
+    try:
+        conn = pg(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM network_events")
+        db_events = int(cur.fetchone()[0])
+        conn.close()
+    except Exception:
+        logger.exception("event=pipeline_metrics_db_failed")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return jsonify({
+        "redis_stream": stream,
+        "stream_entries": total,
+        "pending_entries": pending,
+        "consumer_groups": group_count,
+        "db_events": db_events,
+    })
+
+
+@app.post("/api/agents/heartbeat")
+def agent_heartbeat():
+    payload = request.get_json(silent=True) or {}
+    endpoint_id = (payload.get("endpoint_id") or "").strip()
+    ip_address = (payload.get("ip") or "unknown").strip() or "unknown"
+    if not endpoint_id:
+        return jsonify({"ok": False, "error": "endpoint_id required"}), 400
+
+    try:
+        conn = pg(); cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO endpoint_registry (endpoint_id, ip_address, last_seen, total_chunks)
+            VALUES (%s, %s, NOW(), 0)
+            ON CONFLICT (endpoint_id)
+            DO UPDATE SET ip_address = EXCLUDED.ip_address, last_seen = NOW()
+            """,
+            (endpoint_id, ip_address),
+        )
+        conn.commit(); conn.close()
+        return jsonify({"ok": True})
     except Exception as e:
-        logger.error("[save_settings] ERROR: %s", e)
+        logger.exception("event=agent_heartbeat_failed endpoint_id=%s", endpoint_id)
+        try:
+            conn.close()
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ── Ingest Upload — calls calpa_worker inside stegnar-mitm ───────────────────
-@app.post("/api/ingest/upload")
-def ingest_upload():
+@app.post("/api/ingest/image")
+def ingest_image():
     if "file" not in request.files:
-        logger.warning("[ingest_upload] no file field in request")
         return jsonify({"error": "no file field"}), 400
 
-    f      = request.files["file"]
-    suffix = pathlib.Path(f.filename or "upload").suffix.lower()
-    job_id = f"ingest_{int(time.time())}"
-    logger.info("[ingest_upload] file=%s suffix=%s job_id=%s", f.filename, suffix, job_id)
+    upload = request.files["file"]
+    suffix = pathlib.Path(upload.filename or "upload.jpg").suffix.lower() or ".jpg"
+    if suffix not in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
+        return jsonify({"error": "unsupported image format"}), 400
 
-    if suffix in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=TEMP_DIR) as tmp:
-            tmp_path = tmp.name
-            f.save(tmp_path)
-        logger.info("[ingest_upload] Saved %d bytes to %s", os.path.getsize(tmp_path), tmp_path)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=TEMP_DIR) as tmp:
+        tmp_path = tmp.name
+        upload.save(tmp_path)
 
-        try:
-            container_path = f"/tmp/ingest_upload{suffix}"
-            cp_result = subprocess.run(
-                ["docker", "cp", tmp_path, f"stegnar-mitm:{container_path}"],
-                capture_output=True, timeout=15,
-            )
-            if cp_result.returncode != 0:
-                raise Exception(f"docker cp failed: {cp_result.stderr.decode()}")
-            logger.info("[ingest_upload] docker cp OK → stegnar-mitm:%s", container_path)
+    job_id = _start_ingest_image_job(tmp_path, upload.filename or "upload")
+    return jsonify({"job_id": job_id, "status": "queued"}), 202
 
-            payload = json.dumps({
-                "image_path": container_path,
-                "model_type": "srnet",
-                "model_path": "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt",
-                "libs_path":  "/calpa/libs",
-                "artifact_id": f.filename or "upload",
-            })
 
-            logger.info("[ingest_upload] Running CALPA on stegnar-mitm…")
-            proc = subprocess.run(
-                ["docker", "exec", "-i",
-                 "-e", "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python",
-                 "stegnar-mitm",
-                 "/opt/tf1/bin/python3.7", "/app/calpa_worker.py"],
-                input=payload.encode("utf-8"),
-                capture_output=True,
-                timeout=300,
-            )
-            pathlib.Path(tmp_path).unlink(missing_ok=True)
+@app.post("/api/ingest/pcap")
+def ingest_pcap():
+    if "pcap" not in request.files or "keys" not in request.files:
+        return jsonify({"error": "pcap and keys files required"}), 400
 
-            stdout = proc.stdout.decode("utf-8", errors="replace").strip()
-            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-            logger.info("[ingest_upload] CALPA returncode=%d stdout=%s", proc.returncode, stdout[:200])
-            if stderr:
-                logger.debug("[ingest_upload] CALPA stderr=%s", stderr[:300])
+    pcap_file = request.files["pcap"]
+    key_file = request.files["keys"]
+    os.makedirs(TEMP_DIR, exist_ok=True)
 
-            if proc.returncode == 0 and stdout:
-                data     = json.loads(stdout)
-                is_stego = data.get("predicted_label") == "STEGO"
-                score    = float(data.get("confidence", 0))
-                logger.info(
-                    "[ingest_upload] RESULT label=%s score=%.4f latency=%sms",
-                    data.get("predicted_label"), score, data.get("latency_ms"),
-                )
-                return jsonify({
-                    "job_id":           job_id,
-                    "status":           "completed",
-                    "images_extracted": 1,
-                    "threats_found":    1 if is_stego else 0,
-                    "max_calpa_score":  score,
-                    "predicted_label":  data.get("predicted_label", "UNKNOWN"),
-                    "latency_ms":       data.get("latency_ms", 0),
-                })
-            else:
-                logger.warning("[ingest_upload] Worker returned no output — using fallback")
+    with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False, dir=TEMP_DIR) as ptmp:
+        pcap_path = ptmp.name
+        pcap_file.save(pcap_path)
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False, dir=TEMP_DIR) as ktmp:
+        key_path = ktmp.name
+        key_file.save(key_path)
 
-        except subprocess.TimeoutExpired:
-            pathlib.Path(tmp_path).unlink(missing_ok=True)
-            logger.error("[ingest_upload] CALPA TIMEOUT (300s)")
-        except Exception as e:
-            try: pathlib.Path(tmp_path).unlink(missing_ok=True)
-            except: pass
-            logger.error("[ingest_upload] Error: %s", e)
+    job_id = _start_ingest_pcap_job(
+        pcap_path,
+        key_path,
+        pcap_file.filename or "capture.pcap",
+        key_file.filename or "sslkeylog.log",
+    )
+    return jsonify({"job_id": job_id, "status": "queued"}), 202
 
-    logger.warning("[ingest_upload] Falling back to CLEAN result for job_id=%s", job_id)
-    return jsonify({
-        "job_id": job_id, "status": "completed",
-        "images_extracted": 1, "threats_found": 0,
-        "max_calpa_score": 0.08, "predicted_label": "CLEAN",
-    })
+
+@app.get("/api/ingest/jobs")
+def ingest_jobs():
+    limit = min(int(request.args.get("limit", 50)), 200)
+    with INGEST_LOCK:
+        jobs = list(INGEST_JOBS.values())
+    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=True)
+    return jsonify(jobs[:limit])
+
+
+@app.get("/api/ingest/jobs/<job_id>")
+def ingest_job(job_id):
+    with INGEST_LOCK:
+        job = INGEST_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(job)
+
+
+@app.post("/api/ingest/upload")
+def ingest_upload_legacy():
+    return ingest_image()
 
 
 # ── WebSocket live events ──────────────────────────────────────────────────────
 @sock.route("/ws/events")
 def ws_events(ws):
-    logger.info("[ws_events] Client connected")
     last_ts = None
     while True:
+        conn = None
         try:
             conn = pg()
-            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             if last_ts is None:
                 cur.execute("SELECT ts FROM network_events ORDER BY ts DESC LIMIT 1")
                 row = cur.fetchone()
                 last_ts = str(row["ts"]) if row else "2000-01-01"
-                logger.debug("[ws_events] Initialized last_ts=%s", last_ts)
             else:
-                cur.execute("""
-                    SELECT sha256 AS sha256_hash,
-                           steg_score AS calpa_score,
-                           verdict AS classification,
-                           ts AS first_seen_ts,
-                           endpoint_id, src_ip, dst_ip,
-                           event_id::text,
-                           image_uri AS minio_img_uri,
-                           pcap_uri  AS minio_pcap_uri
-                    FROM network_events
-                    WHERE ts > %s::timestamptz
-                    ORDER BY ts ASC LIMIT 10
-                """, (last_ts,))
+                cur.execute("""SELECT sha256 AS sha256_hash, steg_score AS calpa_score,
+                               verdict AS classification, ts AS first_seen_ts,
+                               endpoint_id, src_ip, dst_ip, event_id::text
+                               FROM network_events WHERE ts > %s::timestamptz
+                               ORDER BY ts ASC LIMIT 10""", (last_ts,))
                 rows = cur.fetchall()
-                v_map = {"STEGO": "malicious", "CLEAN": "benign", "AMBIGUOUS": "suspicious"}
                 for r in rows:
                     row = dict(r)
-                    for k, v in row.items():
-                        if hasattr(v, "isoformat"):
-                            row[k] = v.isoformat()
-                    row["classification"] = v_map.get(row.get("classification", ""), "benign")
+                    for k,v in row.items():
+                        if hasattr(v,"isoformat"): row[k] = v.isoformat()
+                    row["classification"] = {"STEGO":"malicious","CLEAN":"benign","AMBIGUOUS":"suspicious"}.get(row.get("classification",""),"benign")
                     last_ts = row["first_seen_ts"]
-                    msg = json.dumps({"type": "new_image", "payload": row})
-                    ws.send(msg)
-                    logger.debug("[ws_events] Pushed event: sha=%s verdict=%s", str(row.get("sha256_hash",""))[:12], row.get("classification"))
+                    ws.send(json.dumps({"type":"new_image","payload":row}))
             conn.close()
-        except Exception as e:
-            logger.warning("[ws_events] Error: %s", e)
+        except psycopg2.OperationalError as exc:
+            logger.warning("event=ws_events_db_unavailable error=%s", exc)
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            time.sleep(5)
+        except Exception:
+            logger.exception("event=ws_events_failed")
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
         time.sleep(2)
 
 
-# ── Proxy Monitoring ────────────────────────────────────────────────────────────
-@app.get("/api/proxy/logs")
-def proxy_logs():
-    try:
-        proc = subprocess.run(
-            ["curl", "-s", "--unix-socket", "/var/run/docker.sock", 
-             "http://localhost/containers/stegnar-proxy/logs?stdout=1&stderr=1&tail=100"],
-            capture_output=True, text=False, timeout=5
-        )
-        # Docker log stream multiplexing format has an 8-byte header per line. 
-        # Using curl on the raw API requires stripping the headers if they are tty=false.
-        # But for simple display, we can just decode with 'replace' and strip non-printable.
-        # A cleaner way is just using regular `docker` if installed, but since we only have curl:
-        raw_logs = proc.stdout.decode('utf-8', errors='ignore')
-        
-        # Super simple cleanup of docker multiplex headers (8 bytes at start of each chunk)
-        # Actually, let's just strip non-ascii and weird control chars
-        import re
-        clean_logs = re.sub(r'[\x00-\x09\x0B-\x1F\x7F]', '', raw_logs)
-        lines = [line for line in clean_logs.split("\n") if line.strip()]
-        return jsonify(lines[-100:])
-    except Exception as e:
-        logger.error("[proxy_logs] ERROR: %s", e)
-        return jsonify([f"Error fetching proxy logs: {e}"])
-
-@app.get("/api/proxy/metrics")
-def proxy_metrics():
-    try:
-        proc = subprocess.run(
-            ["curl", "-s", "--unix-socket", "/var/run/docker.sock", 
-             "http://localhost/containers/stegnar-proxy/logs?stdout=1&stderr=1&tail=1000"],
-            capture_output=True, text=False, timeout=5
-        )
-        raw_logs = proc.stdout.decode('utf-8', errors='ignore')
-        import re
-        clean_logs = re.sub(r'[\x00-\x09\x0B-\x1F\x7F]', '', raw_logs)
-        lines = clean_logs.split("\n")
-        
-        intercepted = sum(1 for line in lines if "clientconnect" in line.lower() or "serverconnect" in line.lower())
-        total_lines = len(lines)
-        
-        return jsonify({
-            "status": "active",
-            "intercepted_connections": intercepted,
-            "total_log_lines": total_lines,
-            "uptime_status": "Healthy"
-        })
-    except Exception as e:
-        logger.error("[proxy_metrics] ERROR: %s", e)
-        return jsonify({
-            "status": "error",
-            "intercepted_connections": 0,
-            "total_log_lines": 0,
-            "uptime_status": "Error"
-        })
-# ── Ingest API ─────────────────────────────────────────────────────────────────
-@app.post("/api/ingest/image")
-def ingest_image():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    
-    img_bytes = file.read()
-    if not img_bytes:
-        return jsonify({"error": "Empty file"}), 400
-    
-    logger.info("[ingest_image] Received manual image upload: %d bytes", len(img_bytes))
-    
-    try:
-        # Call MITM (CALPA-NET) directly
-        channel = grpc.insecure_channel("stegnar-mitm:50052")
-        stub = pbg.MitmGatewayStub(channel)
-        
-        req = pb.ImageAnalysisRequest(
-            image_chunk=img_bytes,
-            endpoint_id="manual-ingest",
-            stream_id="manual-" + str(int(time.time())),
-            image_format="jpeg"
-        )
-        
-        resp = stub.AnalyzeImage(req, timeout=15.0)
-        
-        return jsonify({
-            "status": "success",
-            "classification": resp.classification,
-            "confidence": resp.confidence,
-            "inference_time_ms": resp.inference_time_ms,
-            "message": "Image analyzed successfully via CALPA-NET."
-        })
-    except Exception as e:
-        logger.error("[ingest_image] gRPC error: %s", e)
-        return jsonify({"error": f"Failed to contact model: {str(e)}"}), 500
-
-@app.post("/api/ingest/pcap")
-def ingest_pcap():
-    # Placeholder for PCAP upload, which requires pcap_builder and keylog parsing
-    # Since soc-api doesn't have the routing-system's complex pcap carving logic loaded,
-    # we simulate the analysis for the demo or forward it if needed.
-    return jsonify({
-        "status": "success",
-        "message": "PCAP parsed and image extracted successfully.",
-        "classification": "CLEAN",
-        "confidence": 0.99
-    })# ── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Ensure temp directory exists for upload staging.
     os.makedirs(TEMP_DIR, exist_ok=True)
-    logger.info("[SOC-API] Starting on http://0.0.0.0:3001")
-    logger.info("[SOC-API] Postgres  → %s:%d/%s", PG_HOST, PG_PORT, PG_DB)
-    logger.info("[SOC-API] Redis     → %s:%d",     REDIS_HOST, REDIS_PORT)
-    logger.info("[SOC-API] MinIO     → %s",         MINIO_ENDPOINT)
+    print("[SOC-API] Starting on http://localhost:3001")
+    print(f"[SOC-API] Postgres  → {PG_HOST}:{PG_PORT}/{PG_DB}")
+    print(f"[SOC-API] Redis     → {REDIS_HOST}:{REDIS_PORT}")
+    print(f"[SOC-API] MinIO     → {MINIO_ENDPOINT}")
     app.run(host="0.0.0.0", port=3001, debug=False)

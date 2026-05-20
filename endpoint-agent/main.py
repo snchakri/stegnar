@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import pathlib
 import signal
 import socket as _sock
 import subprocess
@@ -31,12 +32,17 @@ from key_extractor import watch_keylog
 from grpc_client   import stream_to_router
 
 IFACE          = os.environ.get("CAPTURE_IFACE",   "eth0")
+CAPTURE_FILTER = os.environ.get(
+    "CAPTURE_FILTER",
+    "not port 50051 and not port 50052 and not port 8080 and not port 9000",
+)
 KEYLOG_PATH    = os.environ.get("SSLKEYLOGFILE",   "/tmp/ssl_keys.log")
 TARGET_URL     = os.environ.get("TARGET_URL",       "")
 ENDPOINT_ID    = os.environ.get("ENDPOINT_ID",      "unknown")
 SOC_API_URL    = os.environ.get("SOC_API_URL",      "http://soc-api:3001")
 FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", "25"))  # seconds between fetches
 QUEUE_SIZE     = 1000
+SEND_ONCE_MARKER = os.environ.get("SEND_ONCE_MARKER", "/tmp/stegnar_send_once.done")
 
 
 async def heartbeat_loop(stop_event: asyncio.Event):
@@ -83,6 +89,12 @@ async def fetch_loop(pkt_queue: asyncio.Queue, stop_event: asyncio.Event):
         await stop_event.wait()
         return
 
+    marker_path = pathlib.Path(SEND_ONCE_MARKER)
+    if marker_path.exists():
+        logger.info("[fetch_loop] Send-once marker exists (%s). Skipping upload.", marker_path)
+        await stop_event.wait()
+        return
+
     logger.info("[fetch_loop] Starting single upload — file=%s target=%s", IMAGE_FILE, TARGET_URL)
 
     # Initial warm-up delay so routing comes fully online
@@ -100,6 +112,13 @@ async def fetch_loop(pkt_queue: asyncio.Queue, stop_event: asyncio.Event):
             "[fetch_loop] Upload completed. rc=%d stdout=%s stderr=%s",
             proc.returncode, proc.stdout.decode()[:100], proc.stderr.decode(errors="ignore")[:200],
         )
+
+        if proc.returncode == 0:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(str(int(_time.time())), encoding="utf-8")
+            logger.info("[fetch_loop] Send-once marker written: %s", marker_path)
+        else:
+            logger.warning("[fetch_loop] Upload failed, marker not written (rc=%d)", proc.returncode)
 
     except subprocess.TimeoutExpired:
         logger.error("[fetch_loop] Upload TIMED OUT for %s", TARGET_URL)
@@ -126,12 +145,12 @@ async def main():
     loop.add_signal_handler(signal.SIGINT,  _handle_signal)
 
     logger.info(
-        "[Agent] Starting — id=%s iface=%s keylog=%s target=%s fetch_interval=%ds",
-        ENDPOINT_ID, IFACE, KEYLOG_PATH, TARGET_URL or "(none)", FETCH_INTERVAL,
+        "[Agent] Starting — id=%s iface=%s keylog=%s target=%s capture_filter=%s marker=%s fetch_interval=%ds",
+        ENDPOINT_ID, IFACE, KEYLOG_PATH, TARGET_URL or "(none)", CAPTURE_FILTER, SEND_ONCE_MARKER, FETCH_INTERVAL,
     )
 
     tasks = [
-        asyncio.create_task(capture_loop(IFACE, pkt_queue, stop_event),         name="sniffer"),
+        asyncio.create_task(capture_loop(IFACE, pkt_queue, stop_event, CAPTURE_FILTER), name="sniffer"),
         asyncio.create_task(watch_keylog(KEYLOG_PATH, key_queue, stop_event),   name="key-extractor"),
         asyncio.create_task(stream_to_router(pkt_queue, key_queue, stop_event), name="grpc-stream"),
         asyncio.create_task(fetch_loop(pkt_queue, stop_event),                  name="fetch-loop"),

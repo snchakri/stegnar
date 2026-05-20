@@ -13,8 +13,8 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger("stegnar.data.minio")
 
 ENDPOINT   = os.environ.get("MINIO_ENDPOINT", "minio:9000")
-ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "stegnar")
-SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "stegnar_minio_secret")
+ACCESS_KEY = os.environ.get("MINIO_ACCESS", os.environ.get("MINIO_ACCESS_KEY", "stegnar"))
+SECRET_KEY = os.environ.get("MINIO_SECRET", os.environ.get("MINIO_SECRET_KEY", "stegnar_minio_secret"))
 SECURE     = os.environ.get("MINIO_SECURE", "false").lower() == "true"
 
 

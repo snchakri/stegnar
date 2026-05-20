@@ -32,6 +32,10 @@ function layoutEndpoints(endpoints: EndpointNode[]): EndpointNode[] {
   }));
 }
 
+function computeStatus(stegoCount: number): 'healthy' | 'warning' | 'critical' {
+  return stegoCount > 0 ? 'critical' : 'healthy';
+}
+
 export function TopologyPage() {
   const navigate = useNavigate();
   const [endpoints,      setEndpoints]      = useState<EndpointNode[]>([]);
@@ -53,7 +57,7 @@ export function TopologyPage() {
           endpoint_id:    ep.endpoint_id,
           x:              0, // layout applied below
           y:              0,
-          status:         ep.stego_count > 0 ? 'critical' : parseInt(ep.images_intercepted) > 10 ? 'warning' : 'healthy',
+          status:         computeStatus(parseInt(ep.stego_count) || 0),
           activity_count: parseInt(ep.images_intercepted) || 0,
           ip:             ep.ip || ep.endpoint_id,
           stego_count:    parseInt(ep.stego_count) || 0,
@@ -78,7 +82,7 @@ export function TopologyPage() {
 
   // WebSocket listener — update node color when a new event arrives
   useEffect(() => {
-    initWebSocket((img: any) => {
+    const unsubscribe = initWebSocket((img: any) => {
       const epId = img.endpoint_id;
       if (!epId) return;
       setEndpoints(prev => prev.map(ep => {
@@ -88,10 +92,11 @@ export function TopologyPage() {
           ...ep,
           stego_count:    newStego,
           activity_count: ep.activity_count + 1,
-          status:         newStego > 0 ? 'critical' : ep.activity_count + 1 > 10 ? 'warning' : 'healthy',
+          status:         computeStatus(newStego),
         };
       }));
     });
+    return () => unsubscribe();
   }, []);
 
   const handleIsolate = () => {

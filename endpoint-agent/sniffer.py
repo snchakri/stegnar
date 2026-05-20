@@ -34,6 +34,7 @@ async def capture_loop(
     iface: str,
     queue: asyncio.Queue,
     stop_event: asyncio.Event,
+    bpf_filter: str,
 ):
     """
     Continuously capture packets on `iface` and push CapturedPacket objects
@@ -70,8 +71,8 @@ async def capture_loop(
         # Thread-safe push into the asyncio queue
         loop.call_soon_threadsafe(queue.put_nowait, cp)
 
-    logger.info("Starting packet capture on interface '%s' (filter: not port 50051 and not port 50052 and not port 8080 and not port 9000)", iface)
-    sniffer = AsyncSniffer(iface=iface, prn=_handle_pkt, store=False, filter="not port 50051 and not port 50052 and not port 8080 and not port 9000")
+    logger.info("Starting packet capture on interface '%s' (filter: %s)", iface, bpf_filter)
+    sniffer = AsyncSniffer(iface=iface, prn=_handle_pkt, store=False, filter=bpf_filter)
     sniffer.start()
 
     try:

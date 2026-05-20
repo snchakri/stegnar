@@ -3,6 +3,7 @@ import {
   Database, Server, Image, Activity, Network,
   FileText, Settings as SettingsIcon, HardDrive,
   Upload, Menu, X, Shield, Globe, Filter,
+  AlertTriangle,
 } from 'lucide-react';
 
 const navItems = [
@@ -10,9 +11,10 @@ const navItems = [
   { path: '/redis',       label: 'Redis',       icon: Server       },
   { path: '/images',      label: 'Image Feed',  icon: Image        },
   { path: '/proxy',       label: 'Proxy Logs',  icon: Globe        },
-  { path: '/ingest',      label: 'Ingest',      icon: Filter       },
+  { path: '/ingest',      label: 'Ingest Debug', icon: Filter      },
   { path: '/storage',     label: 'Storage',     icon: HardDrive    },
   { path: '/performance', label: 'Performance', icon: Activity     },
+  { path: '/diagnostics', label: 'Diagnostics',  icon: AlertTriangle },
   { path: '/topology',    label: 'Topology',    icon: Network      },
   { path: '/logs',        label: 'Logs',        icon: FileText     },
   { path: '/ledger',      label: 'Ledger',      icon: Shield       },
