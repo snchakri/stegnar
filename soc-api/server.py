@@ -1202,6 +1202,7 @@ def endpoints():
                        COUNT(CASE WHEN n.verdict='STEGO' THEN 1 END) AS stego_count
                        FROM endpoint_registry r
                        LEFT JOIN network_events n ON r.endpoint_id=n.endpoint_id
+                       WHERE r.last_seen > NOW() - INTERVAL '30 seconds'
                        GROUP BY r.endpoint_id,r.ip_address,r.total_chunks,r.last_seen
                        ORDER BY stego_count DESC""")
         rows = cur.fetchall()
@@ -1211,7 +1212,9 @@ def endpoints():
             cur.execute("""SELECT endpoint_id, endpoint_id AS ip, 'active' AS trust_state,
                           COUNT(*) AS images_intercepted, MAX(ts)::text AS last_activity,
                           COUNT(CASE WHEN verdict='STEGO' THEN 1 END) AS stego_count
-                          FROM network_events GROUP BY endpoint_id""")
+                          FROM network_events 
+                          WHERE ts > NOW() - INTERVAL '30 seconds'
+                          GROUP BY endpoint_id""")
             rows = cur.fetchall()
         except Exception:
             logger.exception("event=endpoints_fallback_failed")
