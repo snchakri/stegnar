@@ -281,7 +281,7 @@ def main():
     profiler.start()
 
     # Load dataset
-    dataset = load_images("/app/test_images")
+    dataset = load_images("/app/test_images/demo_data")
     total_imgs = len(dataset['clean']) + len(dataset['stego'])
     print(f"[TrafficGen Node {args.node_id}] Loaded {total_imgs} images (clean: {len(dataset['clean'])}, stego: {len(dataset['stego'])})")
 
