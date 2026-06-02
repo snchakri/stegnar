@@ -9,6 +9,6 @@ touch /var/log/stegnar/proxy.log
 	iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
 	iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 8080
 
-	echo "[stegnar-proxy] Starting mitmdump in transparent mode..."
-	exec mitmdump --mode transparent --showhost -s addon.py --set confdir=/app/.mitmproxy
+	echo "[stegnar-proxy] Starting mitmdump in transparent & regular modes..."
+	exec mitmdump --mode transparent@8080 --mode regular@8081 --showhost -s addon.py --set confdir=/app/.mitmproxy
 } 2>&1 | tee -a /var/log/stegnar/proxy.log

@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  test-runner:
+    build:
+      context: ./testing
+      dockerfile: Dockerfile.test
+    container_name: stegnar-test-runner
+    environment:
+      - PG_HOST=stegnar-postgres
+      - PG_PORT=5432
+      - PG_USER=stegnar
+      - PG_PASS=stegnar_secret
+      - PG_DB=stegnar
+      - REDIS_HOST=stegnar-redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./test_images:/app/test_images:ro
+      - ./testing:/app/testing:rw
+      - ./runtime/current/proxy/mitmproxy-ca-cert.pem:/etc/ssl/certs/mitmproxy-ca-cert.pem:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - stegnar-net
+
+networks:
+  stegnar-net:
+    name: stegnar_prototype_stegnar-net
+    external: true
