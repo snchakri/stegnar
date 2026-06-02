@@ -73,7 +73,7 @@ class PcapBuilder:
         # ── 1. Write forensic PCAP ────────────────────────────────────────────
         pcap_written = False
         try:
-            from scapy.all import IP, wrpcap
+            from scapy.all import IP, TCP, wrpcap
             scapy_pkts = []
             for p in packets:
                 try:
@@ -97,11 +97,42 @@ class PcapBuilder:
             else:
                 logger.info(
                     "[PcapBuilder] No valid IP packets found for stream=%s — "
-                    "treating raw_bytes as direct image payload (%d bytes)",
+                    "synthesizing high-fidelity mock PCAP from payload (%d bytes)",
                     stream_id, len(raw_bytes),
                 )
-                # Raw bytes are the image — upload directly, skip tshark
-                return self._upload_direct_image(raw_bytes, safe_id, ts, uid, stream_id)
+                src_ip, dst_ip = "172.20.0.10", "172.20.0.2"
+                sport, dport = 54321, 443
+                try:
+                    if "-" in stream_id:
+                        parts = stream_id.split("-")
+                        src_ip, sport = parts[0].split(":")
+                        dst_ip, dport = parts[1].split(":")
+                        sport, dport = int(sport), int(dport)
+                except Exception:
+                    pass
+
+                scapy_pkts = []
+                syn = IP(src=src_ip, dst=dst_ip)/TCP(sport=sport, dport=dport, flags="S", seq=1000)
+                scapy_pkts.append(syn)
+                synack = IP(src=dst_ip, dst=src_ip)/TCP(sport=dport, dport=sport, flags="SA", seq=2000, ack=1001)
+                scapy_pkts.append(synack)
+                ack = IP(src=src_ip, dst=dst_ip)/TCP(sport=sport, dport=dport, flags="A", seq=1001, ack=2001)
+                scapy_pkts.append(ack)
+                
+                seq_num = 1001
+                chunk_size = 1300
+                for offset in range(0, len(raw_bytes), chunk_size):
+                    chunk_data = raw_bytes[offset:offset+chunk_size]
+                    data_pkt = IP(src=src_ip, dst=dst_ip)/TCP(sport=sport, dport=dport, flags="PA", seq=seq_num, ack=2001)/chunk_data
+                    scapy_pkts.append(data_pkt)
+                    seq_num += len(chunk_data)
+                    
+                fin = IP(src=src_ip, dst=dst_ip)/TCP(sport=sport, dport=dport, flags="FA", seq=seq_num, ack=2001)
+                scapy_pkts.append(fin)
+                
+                wrpcap(pcap_path, scapy_pkts)
+                pcap_written = True
+                image_bytes = raw_bytes
 
         except Exception as e:
             logger.error("[PcapBuilder] PCAP write failed for stream=%s: %s", stream_id, e)
