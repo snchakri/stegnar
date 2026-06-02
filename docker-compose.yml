@@ -1,0 +1,344 @@
+services:
+
+  # ===========================================================================
+  # Infrastructure layer
+  # ===========================================================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: stegnar-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - ${RUNTIME_DIR:-./runtime/current}/redis:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: stegnar-postgres
+    environment:
+      POSTGRES_USER: stegnar
+      POSTGRES_PASSWORD: stegnar_secret
+      POSTGRES_DB: stegnar
+    volumes:
+      - ${RUNTIME_DIR:-./runtime/current}/postgres:/var/lib/postgresql/data
+      - ./data-layer/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stegnar -d stegnar"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: stegnar-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: stegnar
+      MINIO_ROOT_PASSWORD: stegnar_minio_secret
+    volumes:
+      - ${RUNTIME_DIR:-./runtime/current}/minio:/data
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # MinIO console
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MinIO bucket initializer (runs once, creates the stegnar-artifacts bucket)
+  minio-init:
+    image: minio/mc:latest
+    container_name: stegnar-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - stegnar-net
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 stegnar stegnar_minio_secret;
+        mc mb --ignore-existing local/stegnar-artifacts;
+        mc mb --ignore-existing local/stegnar-pcaps;
+        echo 'MinIO buckets ready.';
+      "
+    restart: "no"
+
+  # ===========================================================================
+  # Component 4 — Routing System
+  # ===========================================================================
+
+  routing:
+    build:
+      context: .
+      dockerfile: routing-system/Dockerfile
+    container_name: stegnar-routing
+    depends_on:
+      redis:
+        condition: service_healthy
+      mitm:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      MITM_GRPC_ADDR: mitm:50052
+      GRPC_LISTEN_ADDR: "0.0.0.0:50051"
+      RATE_LIMIT_RPS: "1000"
+      POSTGRES_DSN: "postgresql://stegnar:stegnar_secret@postgres:5432/stegnar"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS: stegnar
+      MINIO_SECRET: stegnar_minio_secret
+      LOG_LEVEL: DEBUG
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "50051:50051"    # gRPC for endpoint agents
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # ===========================================================================
+  # Component 3 — MITM Gateway (privileged, eBPF/XDP)
+  # ===========================================================================
+
+  mitm:
+    build:
+      context: .
+      dockerfile: mitm-gateway/Dockerfile
+    container_name: stegnar-mitm
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      GRPC_LISTEN_ADDR: "0.0.0.0:50052"
+      CALPA_PYTHON_PATH: /opt/tf1/bin/python3.7
+      CALPA_MODEL_PATH: /calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt
+      CALPA_CFG_PATH: /calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg
+      CALPA_MODEL_TYPE: srnet
+      CALPA_LIBS_PATH: /calpa/libs
+      CALPA_TIMEOUT_SEC: "120"
+      CALPA_DEVICE: ""
+      STEGNAR_ENV: dev
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./CALPA-NET-master:/calpa:ro
+    ports:
+      - "50052:50052"    # gRPC for routing system
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50052'); grpc.channel_ready_future(ch).result(timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ===========================================================================
+  # Component 2 — Data Layer (Redis consumer → DB + MinIO)
+  # ===========================================================================
+
+  data-layer:
+    build:
+      context: .
+      dockerfile: data-layer/Dockerfile
+    container_name: stegnar-data-layer
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_STREAM: stegnar:db_queue
+      POSTGRES_DSN: "postgresql://stegnar:stegnar_secret@postgres:5432/stegnar"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS: stegnar
+      MINIO_SECRET: stegnar_minio_secret
+      MINIO_BUCKET_ARTIFACTS: stegnar-artifacts
+      MINIO_BUCKET_PCAPS: stegnar-pcaps
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('redis',6379),2); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # Transparent MITM Proxy (Mode C)
+  # ===========================================================================
+
+  stegnar-proxy:
+    build:
+      context: .
+      dockerfile: stegnar-proxy/Dockerfile
+    container_name: stegnar-proxy
+    depends_on:
+      routing:
+        condition: service_healthy
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    environment:
+      ROUTER_GRPC_ADDR: routing:50051
+    ports:
+      - "8080:8080"
+    volumes:
+      - ${RUNTIME_DIR:-./runtime/current}/proxy:/app/.mitmproxy
+      - ${RUNTIME_DIR:-./runtime/current}/logs:/var/log/stegnar
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f mitmdump >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # Installer Server
+  # ===========================================================================
+
+  install-server:
+    build:
+      context: .
+      dockerfile: install-server/Dockerfile
+    container_name: stegnar-install-server
+    ports:
+      - "8081:8080"
+    volumes:
+      - ${RUNTIME_DIR:-./runtime/current}/proxy:/app/certs:ro
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+
+  # ===========================================================================
+  # SOC API and Frontend
+  # ===========================================================================
+
+  soc-api:
+    build:
+      context: .
+      dockerfile: soc-api/Dockerfile
+    container_name: stegnar-soc-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      routing:
+        condition: service_healthy
+      mitm:
+        condition: service_healthy
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: stegnar
+      PG_USER: stegnar
+      PG_PASS: stegnar_secret
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS: stegnar
+      MINIO_SECRET: stegnar_minio_secret
+      SOC_API_TEMP_DIR: /tmp/stegnar-soc
+      # Ingest pipeline wiring — explicit to avoid relying on Python defaults.
+      INGEST_MITM_CONTAINER: "stegnar-mitm"
+      INGEST_EPHEMERAL: "false"
+      INGEST_TIMEOUT_SEC: "300"
+      INGEST_NETWORK: "stegnar-net"
+      # CALPA paths inside the MITM container that calpa_worker.py reads.
+      CALPA_MODEL_PATH: "/calpa/generated_cfg_and_model/trained_pruned_model/Model_438375.ckpt"
+      CALPA_CFG_PATH:   "/calpa/generated_cfg_and_model/srnet_juniward_04_threshold05.cfg"
+      CALPA_LIBS_PATH:  "/calpa/libs"
+      # gRPC addresses for real health-checks.
+      MITM_GRPC_HOST:    "mitm"
+      MITM_GRPC_PORT:    "50052"
+      ROUTING_GRPC_HOST: "routing"
+      ROUTING_GRPC_PORT: "50051"
+      # Redis stream name — must match data-layer consumer.
+      REDIS_STREAM: "stegnar:db_queue"
+    ports:
+      - "3001:3001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${RUNTIME_DIR:-./runtime/current}/logs:/var/log/stegnar
+      - ${RUNTIME_DIR:-./runtime/current}/soc-api-tmp:/tmp/stegnar-soc
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  soc-frontend:
+    build:
+      context: ./soc-frontend
+      dockerfile: Dockerfile
+    container_name: stegnar-soc-frontend
+    depends_on:
+      soc-api:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    networks:
+      - stegnar-net
+    restart: unless-stopped
+
+# ===========================================================================
+# Shared network and volumes
+# ===========================================================================
+
+networks:
+  stegnar-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

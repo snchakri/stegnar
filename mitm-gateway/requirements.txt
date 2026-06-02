@@ -1,0 +1,4 @@
+grpcio==1.64.0
+protobuf>=4.25,<5.0
+redis[hiredis]==5.0.4
+mitmproxy==10.1.6

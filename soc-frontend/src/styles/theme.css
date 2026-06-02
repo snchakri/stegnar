@@ -1,0 +1,142 @@
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Modern Dark Dashboard Design System */
+
+  /* Base surfaces */
+  --bg-primary: #0E1117;
+  --bg-sidebar: #111622;
+  --bg-card: #1B2230;
+  --bg-hover: #222938;
+
+  /* Borders */
+  --border-default: #2A3447;
+  --border-subtle: #1F2633;
+
+  /* Text system */
+  --text-primary: #E6EAF2;
+  --text-secondary: #A0A8B8;
+  --text-muted: #6B7280;
+
+  /* Accent */
+  --accent: #7C8CF8;
+  --accent-hover: #6B7BE8;
+
+  /* Status colors */
+  --status-success: #10B981;
+  --status-warning: #F59E0B;
+  --status-error: #EF4444;
+  --status-info: #3B82F6;
+
+  /* Typography */
+  --text-xs: 11px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 16px;
+  --text-lg: 18px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+
+  --font-size: 14px;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --radius: 8px;
+
+  /* Tailwind compatibility */
+  --background: var(--bg-primary);
+  --foreground: var(--text-primary);
+  --card: var(--bg-card);
+  --card-foreground: var(--text-primary);
+  --border: var(--border-default);
+  --ring: var(--accent);
+}
+
+@theme inline {
+  --color-background: var(--bg-primary);
+  --color-foreground: var(--text-primary);
+  --color-card: var(--card-default);
+  --color-card-foreground: var(--text-primary);
+  --color-border: var(--border-subtle);
+  --color-ring: var(--accent-primary);
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  h1 {
+    font-size: var(--text-2xl);
+    font-weight: 600;
+    line-height: 1.3;
+    letter-spacing: -0.015em;
+  }
+
+  h2 {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    line-height: 1.4;
+  }
+
+  h3 {
+    font-size: var(--text-md);
+    font-weight: 600;
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: var(--text-sm);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 150ms ease;
+    border: none;
+    outline: none;
+  }
+
+  button:hover {
+    opacity: 0.9;
+  }
+
+  input, select {
+    font-size: var(--text-sm);
+    font-weight: 400;
+    outline: none;
+  }
+
+  input:focus, select:focus {
+    border-color: var(--accent);
+  }
+
+  table {
+    border-collapse: collapse;
+  }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes slide-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}

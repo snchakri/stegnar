@@ -1,0 +1,67 @@
+# ==========================================
+# Stegnar Open Source GitIgnore Configurations
+# ==========================================
+
+# Core Application/Runtime Data
+node_modules/
+dist/
+build/
+out/
+runtime/
+temp_data/
+*.log
+*.pcap
+*.key
+
+# Environments & Secret Configurations
+.env
+.env.local
+.env.runtime
+.env.*.local
+
+# Python Build & Caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+.pytest_cache/
+doc/_build/
+
+# Packaging
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+*.egg-info/
+.eggs/
+
+# IDE & Editor specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+.DS_Store
+# Exclude heavy image dataset directories but track scripts and smaller test image sets
+test_images/BOWS2/*/
+test_images/BOWS2/cover/
+test_images/BOWS2/cover_resized/
+test_images/BOWS2/cover_resized_jpg_qf75/
+test_images/BOWS2/cover_resized_jpg_qf95/
+test_images/BOWS2/cover_resized_png/
+test_images/BOWS2/stego_juniward/
+test_images/BOWS2/stego_suniward/
+test_images/BOWS2/stego_suniward_png/
