@@ -193,3 +193,42 @@ This project is licensed under the Apache License 2.0. See the LICENSE file for 
 This work builds upon the foundational research of the academic community in the field of steganalysis. We specifically acknowledge and cite the following works:
 *   **CALPA-NET:** Our modular detection model is adapted from the [tansq/CALPA-NET](https://github.com/tansq/CALPA-NET) repository.
 *   **SRNet & XuNet:** We acknowledge the creators of the Spatial Rich Model (SRNet) and XuNet architectures, whose research and baseline models made this platform possible.
+
+---
+
+## 13. Performance Evaluation & Testing Results
+
+To evaluate the scalability, detection efficacy, and overhead of the Stegnar platform under high load, we conducted extensive stress-testing across simulated multi-container environments. The performance results are compiled below.
+
+### 13.1. Detection Efficacy
+The pruned CALPA-NET model was compared against baseline models to assess detection accuracy. As shown, structured pruning achieves a ~50% reduction in parameters while preserving high classification accuracy.
+![Efficacy Comparison](./images/efficacy_comparison.png)
+
+### 13.2. Processing Latency
+We measured the Mean Time to Detection (MTTD) across various image formats. The ingestion-to-verdict latency remains low, validating the asynchronous gRPC pipeline.
+![MTTD Latency](./images/mttd_latency.png)
+
+### 13.3. Ingestion Throughput
+The hot Redis `HashCache` significantly accelerates the platform's throughput. Duplicate files skip deep-learning inference entirely, maintaining high-throughput handling even during severe traffic spikes.
+![Effective Throughput](./images/effective_throughput.png)
+
+### 13.4. Server Resource Utilization
+We monitored the CPU and memory footprint of the central components (routing system, MITM gateway, and data layer). The decentralized architecture isolates computationally heavy ML processing.
+![Server Resource Utilization](./images/server_utilization.png)
+
+### 13.5. Container Node Performance
+Simulated nodes were profiled under intense traffic loads to check container-level resource consumption.
+![Container CPU Usage](./images/container_cpu_usage.png)
+
+### 13.6. Interception Overhead
+We analyzed the network latency overhead introduced by the Man-in-the-Middle (MITM) and forward proxy setups. The transparent redirection model adds negligible routing overhead to the data stream.
+![Proxy Overhead Comparison](./images/proxy_overhead_comparison.png)
+
+### 13.7. Endpoint Agent Resource Footprint
+The local agent was profiled on Windows/Linux host environments. It maintains a minimal system footprint, avoiding any operational degradation of the user workstation.
+![Endpoint Agent Overhead](./images/agent_overhead.png)
+
+### 13.8. Database & Storage Performance
+We tracked the PostgreSQL and MinIO persistent write latencies to verify ledger integrity under continuous database insertions.
+![Database and Storage Latency](./images/db_storage_latency.png)
+

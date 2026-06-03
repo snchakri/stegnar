@@ -68,6 +68,18 @@ class StegnarAddon:
             content_type = flow.request.headers.get("Content-Type", "")
             if "image/" in content_type.lower() or _sniff_image(flow.request.content):
                 self._process_image(flow, flow.request.content)
+            elif "message/rfc822" in content_type.lower():
+                try:
+                    import email
+                    from email import policy
+                    msg = email.message_from_bytes(flow.request.content, policy=policy.default)
+                    for part in msg.walk():
+                        if part.get_content_maintype() == 'image':
+                            img_bytes = part.get_content()
+                            if img_bytes:
+                                self._process_image(flow, img_bytes)
+                except Exception as e:
+                    print(f"[StegnarAddon] Failed to parse MIME message: {e}")
 
     def response(self, flow: mitmproxy.http.HTTPFlow):
         if flow.response and flow.response.content:

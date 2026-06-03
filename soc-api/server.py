@@ -1199,19 +1199,24 @@ def endpoints():
         conn = pg(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""SELECT r.endpoint_id, r.ip_address AS ip, 'active' AS trust_state,
                        r.total_chunks AS images_intercepted, r.last_seen::text AS last_activity,
-                       COUNT(CASE WHEN n.verdict='STEGO' THEN 1 END) AS stego_count
+                       COUNT(CASE WHEN COALESCE(h.verdict, n.verdict)='STEGO' THEN 1 END) AS stego_count
                        FROM endpoint_registry r
                        LEFT JOIN network_events n ON r.endpoint_id=n.endpoint_id
+                       LEFT JOIN hash_cache h ON n.sha256=h.sha256
+                       WHERE r.last_seen > NOW() - INTERVAL '30 seconds'
                        GROUP BY r.endpoint_id,r.ip_address,r.total_chunks,r.last_seen
                        ORDER BY stego_count DESC""")
         rows = cur.fetchall()
     except Exception:
         logger.exception("event=endpoints_failed")
         try:
-            cur.execute("""SELECT endpoint_id, endpoint_id AS ip, 'active' AS trust_state,
-                          COUNT(*) AS images_intercepted, MAX(ts)::text AS last_activity,
-                          COUNT(CASE WHEN verdict='STEGO' THEN 1 END) AS stego_count
-                          FROM network_events GROUP BY endpoint_id""")
+            cur.execute("""SELECT n.endpoint_id, n.endpoint_id AS ip, 'active' AS trust_state,
+                          COUNT(*) AS images_intercepted, MAX(n.ts)::text AS last_activity,
+                          COUNT(CASE WHEN COALESCE(h.verdict, n.verdict)='STEGO' THEN 1 END) AS stego_count
+                          FROM network_events n
+                          LEFT JOIN hash_cache h ON n.sha256=h.sha256
+                          WHERE n.ts > NOW() - INTERVAL '30 seconds'
+                          GROUP BY n.endpoint_id""")
             rows = cur.fetchall()
         except Exception:
             logger.exception("event=endpoints_fallback_failed")
